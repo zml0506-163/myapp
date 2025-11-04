@@ -16,12 +16,12 @@ from starlette.staticfiles import StaticFiles
 from app.api.v1 import api_router
 from app.db.crud import upsert_clinical_trial, ALLOWED_STATUSES, list_trials_with_pagination, list_papers
 from app.db.database import engine, get_db
-from app.europepmc_client import search_europe_pmc, process_records_and_save_to_db
+from app.tools.europepmc_client import search_europe_pmc, process_records_and_save_to_db
 from app.models import Base, ClinicalTrial, Paper
 from app.db import crud
-from app.pubmed_client import esearch_pmids, efetch_metadata, get_pdf_from_pubmed
+from app.tools.pubmed_client import esearch_pmids, efetch_metadata, get_pdf_from_pubmed
 from app.core.config import settings
-from app.clinical_trials_client import async_search_trials
+from app.tools.clinical_trials_client import async_search_trials
 
 app = FastAPI(
     title=settings.project_name,

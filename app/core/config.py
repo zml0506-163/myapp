@@ -37,7 +37,7 @@ class Settings(BaseModel):
     ]
 
     # 通义千问配置
-    dashscope_api_key: str = ""
+    dashscope_api_key: str = "sk-8f7373b5086249e3b0db5bb3609cc909"
     dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     # 模型配置

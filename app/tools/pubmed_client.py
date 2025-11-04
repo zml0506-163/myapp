@@ -13,8 +13,8 @@ from metapub import FindIt
 
 from fastapi.logger import logger
 
-from app.download_utils import fetch_sync, download_pdf
-from app.publisher_rules import PUBLISHER_RULES, DEFAULT_RULE, get_pdf_path_from_pmcid
+from app.tools.download_utils import fetch_sync, download_pdf
+from app.tools.publisher_rules import PUBLISHER_RULES, DEFAULT_RULE, get_pdf_path_from_pmcid
 import xml.etree.ElementTree as ET
 
 
