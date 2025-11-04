@@ -25,3 +25,7 @@ python-multipart
 asyncpg
 metapub
 DrissionPage
+openai
+langgraph
+langchain
+langchain-openai

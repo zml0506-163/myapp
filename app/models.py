@@ -123,3 +123,34 @@ class Attachment(Base):
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
     mime_type: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+class SearchCache(Base):
+    """检索结果缓存表"""
+    __tablename__ = "search_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    query_type: Mapped[str] = mapped_column(String(32), index=True)  # 'pubmed' or 'clinical_trial'
+    query_text: Mapped[str] = mapped_column(Text, index=True)  # 检索表达式
+    query_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)  # MD5 hash
+    results_json: Mapped[str] = mapped_column(Text)  # JSON 格式的结果
+    hit_count: Mapped[int] = mapped_column(Integer, default=0)  # 命中次数
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+
+
+class WorkflowExecution(Base):
+    """工作流执行记录表"""
+    __tablename__ = "workflow_executions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    workflow_type: Mapped[str] = mapped_column(String(32))  # 'multi_source', etc.
+    status: Mapped[str] = mapped_column(String(32), index=True)  # 'running', 'completed', 'failed'
+    current_step: Mapped[str | None] = mapped_column(String(64))
+    patient_features: Mapped[str | None] = mapped_column(Text)
+    search_queries: Mapped[str | None] = mapped_column(Text)  # JSON
+    error_message: Mapped[str | None] = mapped_column(Text)
+    result_message_id: Mapped[int | None] = mapped_column(Integer)  # 关联的消息ID
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

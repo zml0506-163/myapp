@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from app.core.config import settings
 
@@ -35,3 +37,17 @@ async def get_db() -> AsyncSession:
             raise
         finally:
             await session.close()  # 确保关闭
+
+
+@asynccontextmanager
+async def get_db_session():
+    """获取独立的数据库会话（用完自动关闭）"""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()

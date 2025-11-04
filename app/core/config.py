@@ -36,9 +36,21 @@ class Settings(BaseModel):
         "*",
     ]
 
+    # 通义千问配置
+    dashscope_api_key: str = ""
+    dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+    # 模型配置
+    qwen_max_model: str = "qwen-max"
+    qwen_long_model: str = "qwen-long"
+    qwen_vl_model: str = "qwen3-vl-plus"
+
+    # 检索配置
+    max_search_results: int = 5
+
     class Config:
         env_file = ".env"
-        case_sensitive = True
+        case_sensitive = False
 
 
 settings = Settings()
