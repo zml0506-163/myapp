@@ -2,11 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 import json
 import asyncio
+from typing import List, Dict, Any
+from pydantic import BaseModel
 
 from app.db.database import get_db_session
 from app.models import User
 from app.api.deps import get_current_active_user
-from app.schemas.chat import ChatRequestSchema, ChatMode
 from app.services.llm_service import llm_service
 from app.services.workflow_service_v2 import workflow_service_v2
 from app.crud import message as crud_message, conversation as crud_conversation
@@ -15,20 +16,27 @@ from app.models import MessageType
 
 router = APIRouter()
 
+
+# 聊天请求模型
+class ChatRequest(BaseModel):
+    conversation_id: int
+    content: str
+    mode: str = "normal"  # "normal" | "attachment" | "multi_source"
+    attachments: List[Dict[str, Any]] = []
+
+
 @router.post("/chat/stream")
-async def chat_stream_endpoint(
-        request: ChatRequestSchema,
+async def chat_stream(
+        request: ChatRequest,
         current_user: User = Depends(get_current_active_user)
 ):
     """
-    智能聊天流式接口 - V2
-
-    输出格式优化:
-    - type='log': 过程日志（前端可折叠）
-    - type='result': 步骤结果（前端显示）
-    - type='section_start': 区块开始
-    - type='section_end': 区块结束
-    - type='done': 完成
+    智能聊天流式接口
+    
+    模式说明：
+    - normal: 普通问答
+    - attachment: 附件问答（有附件时自动切换）
+    - multi_source: 多源检索（需要用户明确选择）
     """
 
     # 验证对话归属
@@ -44,6 +52,11 @@ async def chat_stream_endpoint(
                 detail="对话不存在"
             )
 
+    # 自动检测模式：如果有附件且不是多源检索，则使用附件模式
+    actual_mode = request.mode
+    if request.attachments and request.mode == "normal":
+        actual_mode = "attachment"
+
     # 保存用户消息
     async with get_db_session() as db:
         user_message_schema = MessageCreateSchema(
@@ -52,9 +65,9 @@ async def chat_stream_endpoint(
             message_type=MessageType.USER,
             attachments=[
                 {
-                    'filename': att['filename'],
-                    'original_filename': att['original_filename'],
-                    'file_size': att['file_size'],
+                    'filename': att.get('filename', ''),
+                    'original_filename': att.get('original_filename', ''),
+                    'file_size': att.get('file_size', 0),
                     'mime_type': att.get('mime_type')
                 }
                 for att in request.attachments
@@ -71,20 +84,17 @@ async def chat_stream_endpoint(
         try:
             ai_content = ""
 
-            if request.mode == ChatMode.MULTI_SOURCE:
-                # === 模式1: 多源检索工作流（使用新版本）===
+            if actual_mode == "multi_source":
+                # === 模式1: 多源检索工作流 ===
                 async for output in workflow_service_v2.execute_with_streaming(
                         conversation_id=request.conversation_id,
                         user_id=current_user.id,
                         user_query=request.content,
                         user_attachments=request.attachments
                 ):
-                    # 直接转发输出
                     yield f"data: {json.dumps(output, ensure_ascii=False)}\n\n"
 
-                # 工作流已自动保存结果，不需要额外保存
-
-            elif request.mode == ChatMode.WITH_ATTACHMENT:
+            elif actual_mode == "attachment":
                 # === 模式2: 附件问答 ===
                 if not request.attachments:
                     yield f"data: {json.dumps({'type': 'error', 'content': '未提供附件'}, ensure_ascii=False)}\n\n"
@@ -97,28 +107,26 @@ async def chat_stream_endpoint(
                                    if att.get('mime_type') == 'application/pdf']
 
                 if image_attachments:
-                    # 图片问答 - 使用 qwen3-vl-plus
+                    # 图片问答
                     for att in image_attachments:
                         async for chunk in llm_service.chat_with_image_stream(
                                 text=request.content,
-                                image_path=att['file_path']
+                                image_path=att.get('file_path', '')
                         ):
                             ai_content += chunk
                             yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
 
                 elif pdf_attachments:
-                    # PDF 问答 - 使用 qwen-long
+                    # PDF 问答
                     if len(pdf_attachments) == 1:
-                        # 单个 PDF
                         async for chunk in llm_service.chat_with_pdf_stream(
                                 text=request.content,
-                                pdf_path=pdf_attachments[0]['file_path']
+                                pdf_path=pdf_attachments[0].get('file_path', '')
                         ):
                             ai_content += chunk
                             yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
                     else:
-                        # 多个 PDF
-                        pdf_paths = [att['file_path'] for att in pdf_attachments]
+                        pdf_paths = [att.get('file_path', '') for att in pdf_attachments]
                         async for chunk in llm_service.chat_with_multiple_pdfs_stream(
                                 text=request.content,
                                 pdf_paths=pdf_paths
@@ -144,10 +152,8 @@ async def chat_stream_endpoint(
 
                     yield f"data: {json.dumps({'type': 'done', 'message_id': ai_message['id']}, ensure_ascii=False)}\n\n"
 
-            elif request.mode == ChatMode.NORMAL:
+            else:  # normal mode
                 # === 模式3: 普通问答 ===
-
-                # 加载历史对话（最近5条）
                 async with get_db_session() as db:
                     from sqlalchemy import select
                     from app.models import Message
@@ -160,7 +166,6 @@ async def chat_stream_endpoint(
                     )
                     history_messages = result.scalars().all()
 
-                # 构建消息列表
                 messages = []
                 for msg in reversed(list(history_messages)):
                     messages.append({
@@ -168,10 +173,8 @@ async def chat_stream_endpoint(
                         "content": msg.content
                     })
 
-                # 添加当前问题
                 messages.append({"role": "user", "content": request.content})
 
-                # 流式生成回答
                 async for chunk in llm_service.chat_stream(messages=messages):
                     ai_content += chunk
                     yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
@@ -192,8 +195,7 @@ async def chat_stream_endpoint(
                     yield f"data: {json.dumps({'type': 'done', 'message_id': ai_message['id']}, ensure_ascii=False)}\n\n"
 
         except asyncio.CancelledError:
-            # 客户端断开连接
-            if ai_content and request.mode != ChatMode.MULTI_SOURCE:
+            if ai_content and actual_mode != "multi_source":
                 async with get_db_session() as db:
                     ai_message_schema = MessageCreateSchema(
                         conversation_id=request.conversation_id,
@@ -210,6 +212,7 @@ async def chat_stream_endpoint(
         except Exception as e:
             import traceback
             error_detail = traceback.format_exc()
+            print(f"Chat Error: {error_detail}")
             yield f"data: {json.dumps({'type': 'error', 'content': f'❌ 错误: {str(e)}'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(

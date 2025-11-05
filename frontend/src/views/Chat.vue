@@ -9,7 +9,7 @@
             <Fold v-if="sidebarOpen" />
             <Expand v-else />
           </el-icon>
-          <span v-if="sidebarOpen">PubMed & 多来源检索</span>
+          <span v-if="sidebarOpen">对话列表</span>
         </div>
         <el-button 
           v-if="sidebarOpen" 
@@ -74,10 +74,9 @@
           </div>
         </div>
         
-        <!-- 空状态 -->
         <el-empty 
           v-if="!chatStore.loading && !chatStore.conversations.length" 
-          description="暂无对话，点击上方按钮创建新对话"
+          description="暂无对话"
           :image-size="100"
         />
       </div>
@@ -115,13 +114,9 @@
       <div class="chat-header">
         <h1>{{ getCurrentChatTitle() }}</h1>
         
-        <!-- 模式选择器 -->
-        <div class="chat-mode-selector">
-          <el-select v-model="chatMode" placeholder="选择对话模式" style="width: 200px">
-            <el-option label="普通问答" value="normal" />
-            <el-option label="附件问答" value="attachment" :disabled="attachments.length === 0" />
-            <el-option label="多源检索" value="multi_source" />
-          </el-select>
+        <!-- 多源检索开关 -->
+        <div class="multi-source-toggle">
+          <el-checkbox v-model="enableMultiSource" label="多源检索" size="large" />
         </div>
       </div>
 
@@ -148,6 +143,7 @@
             <div class="message-content">
               <div :class="['message-bubble', message.message_type === 'user' ? 'user-bubble' : 'assistant-bubble']">
                 <div class="message-text" v-html="renderMarkdown(message.content)"></div>
+                
                 <!-- 附件显示 -->
                 <div v-if="message.attachments && message.attachments.length > 0" class="message-attachments">
                   <el-tag
@@ -157,7 +153,7 @@
                     size="small"
                   >
                     <el-icon style="margin-right: 4px"><Paperclip /></el-icon>
-                    {{ att.original_filename }} ({{ formatFileSize(att.file_size) }})
+                    {{ att.original_filename }}
                   </el-tag>
                 </div>
               </div>
@@ -184,18 +180,17 @@
                   
                   <!-- 区块内容 -->
                   <div v-show="!section.collapsed" class="section-content">
-                    <!-- 日志（可折叠） -->
+                    <!-- 日志 -->
                     <div v-if="section.logs.length > 0" class="logs-container">
                       <div
                         v-for="(log, logIdx) in section.logs"
                         :key="logIdx"
                         :class="['log-item', `log-source-${log.source || 'default'}`]"
-                      >
-                        <span v-html="log.content"></span>
-                      </div>
+                        v-html="log.content"
+                      ></div>
                     </div>
                     
-                    <!-- 结果（始终显示） -->
+                    <!-- 结果 -->
                     <div v-if="section.results.length > 0" class="results-container">
                       <div
                         v-for="(result, resultIdx) in section.results"
@@ -223,9 +218,13 @@
       <div class="chat-footer">
         <div class="input-wrapper">
           <!-- 附件预览 -->
-          <div v-if="attachments.length > 0" class="attachments-preview">
+          <div v-if="conversationAttachments.length > 0" class="attachments-preview">
+            <div class="attachments-header">
+              <span>当前会话附件：</span>
+              <el-button text size="small" @click="clearAllAttachments">清除全部</el-button>
+            </div>
             <el-tag
-              v-for="att in attachments"
+              v-for="att in conversationAttachments"
               :key="att.id"
               closable
               @close="removeAttachment(att.id)"
@@ -271,7 +270,7 @@
                   <!-- 发送按钮 -->
                   <el-button
                     type="primary"
-                    :disabled="(!inputValue.trim() && attachments.length === 0) || !chatStore.currentConversationId"
+                    :disabled="!inputValue.trim() || !chatStore.currentConversationId"
                     :loading="isSending"
                     @click="handleSend"
                     class="send-btn"
@@ -284,8 +283,9 @@
           </div>
 
           <p class="input-hint">
-            按 Enter 发送，Ctrl + Enter 换行 | 
-            当前模式: <strong>{{ getModeLabel() }}</strong>
+            按 Enter 发送，Ctrl + Enter 换行
+            <span v-if="conversationAttachments.length > 0"> | 附件模式</span>
+            <span v-if="enableMultiSource"> | 多源检索</span>
           </p>
         </div>
       </div>
@@ -303,7 +303,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick, onMounted, computed } from 'vue'
+import { ref, nextTick, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
@@ -321,7 +321,6 @@ import {
   Expand,
   Fold,
   MoreFilled,
-  Setting,
   SwitchButton,
   ArrowUp
 } from '@element-plus/icons-vue'
@@ -335,7 +334,7 @@ const chatStore = useChatStore()
 
 // 状态
 const inputValue = ref('')
-const attachments = ref([])
+const conversationAttachments = ref([])  // 当前会话的附件
 const sidebarOpen = ref(true)
 const chatMainRef = ref(null)
 const uploadRef = ref(null)
@@ -346,24 +345,24 @@ const renamingChatId = ref(null)
 const isRenaming = ref(false)
 const isSending = ref(false)
 const isAITyping = ref(false)
-const chatMode = ref('normal')
+const enableMultiSource = ref(false)  // 多源检索开关
 const workflowDone = ref(false)
-
-// 工作流区块数据结构
 const workflowSections = ref([])
+
+// 监听对话切换，清空附件
+watch(() => chatStore.currentConversationId, () => {
+  conversationAttachments.value = []
+})
 
 // 初始化
 onMounted(async () => {
   try {
-    // 获取用户信息
     if (!userStore.userInfo) {
       await userStore.getUserInfo()
     }
     
-    // 获取对话列表
     await chatStore.fetchConversations()
     
-    // 如果有对话，自动选择第一个
     if (chatStore.conversations.length > 0 && !chatStore.currentConversationId) {
       await chatStore.switchConversation(chatStore.conversations[0].id)
     }
@@ -378,16 +377,6 @@ const renderMarkdown = (content) => {
   if (!content) return ''
   const html = marked.parse(content)
   return DOMPurify.sanitize(html)
-}
-
-// 获取模式标签
-const getModeLabel = () => {
-  const labels = {
-    'normal': '普通问答',
-    'attachment': '附件问答',
-    'multi_source': '多源检索'
-  }
-  return labels[chatMode.value] || '普通问答'
 }
 
 // 滚动到底部
@@ -413,8 +402,7 @@ const adjustTextareaHeight = () => {
 const handleCreateNewChat = async () => {
   try {
     await chatStore.createNewConversation('新对话')
-    inputValue.value = ''
-    attachments.value = []
+    conversationAttachments.value = []
   } catch (error) {
     console.error('创建对话失败:', error)
   }
@@ -429,8 +417,7 @@ const handleSwitchChat = async (chatId) => {
   
   try {
     await chatStore.switchConversation(chatId)
-    inputValue.value = ''
-    attachments.value = []
+    conversationAttachments.value = []
     scrollToBottom()
   } catch (error) {
     console.error('切换对话失败:', error)
@@ -495,18 +482,24 @@ const handleUserAction = async (command) => {
 
 // 发送消息
 const handleSend = async () => {
-  if (!inputValue.value.trim() && attachments.value.length === 0) return
+  if (!inputValue.value.trim()) return
   if (!chatStore.currentConversationId) {
     ElMessage.warning('请先创建或选择对话')
     return
   }
 
   const content = inputValue.value.trim()
-  const currentAttachments = [...attachments.value]
   
+  // 确定模式
+  let mode = 'normal'
+  if (enableMultiSource.value) {
+    mode = 'multi_source'
+  } else if (conversationAttachments.value.length > 0) {
+    mode = 'attachment'
+  }
+
   // 清空输入
   inputValue.value = ''
-  attachments.value = []
   
   if (textareaRef.value) {
     textareaRef.value.style.height = 'auto'
@@ -515,11 +508,11 @@ const handleSend = async () => {
   isSending.value = true
   isAITyping.value = true
   workflowDone.value = false
-  workflowSections.value = []  // 清空工作流区块
+  workflowSections.value = []
   
   try {
     // 发送用户消息
-    await chatStore.sendUserMessage(content, currentAttachments)
+    await chatStore.sendUserMessage(content, conversationAttachments.value)
     scrollToBottom()
     
     // 调用流式 API
@@ -535,14 +528,8 @@ const handleSend = async () => {
       body: JSON.stringify({
         conversation_id: chatStore.currentConversationId,
         content: content,
-        mode: chatMode.value,
-        attachments: currentAttachments.map(att => ({
-          filename: att.filename,
-          original_filename: att.original_filename,
-          file_size: att.file_size,
-          mime_type: att.mime_type,
-          file_path: att.file_path
-        }))
+        mode: mode,
+        attachments: conversationAttachments.value
       })
     })
 
@@ -568,12 +555,11 @@ const handleSend = async () => {
             const data = JSON.parse(line.slice(6))
             
             if (data.type === 'section_start') {
-              // 开始新区块
               currentSection = {
                 step: data.step,
                 title: data.title,
                 collapsible: data.collapsible !== false,
-                collapsed: false,  // 初始展开
+                collapsed: false,
                 logs: [],
                 results: [],
                 summary: ''
@@ -581,14 +567,12 @@ const handleSend = async () => {
               workflowSections.value.push(currentSection)
               
             } else if (data.type === 'section_end') {
-              // 区块结束，折叠日志
               if (currentSection && currentSection.collapsible) {
                 currentSection.collapsed = true
               }
               currentSection = null
               
             } else if (data.type === 'log') {
-              // 日志消息
               if (currentSection) {
                 currentSection.logs.push({
                   content: data.content,
@@ -597,7 +581,6 @@ const handleSend = async () => {
               }
               
             } else if (data.type === 'result') {
-              // 结果消息
               if (currentSection) {
                 if (data.content) {
                   currentSection.results.push({
@@ -611,9 +594,7 @@ const handleSend = async () => {
               }
               
             } else if (data.type === 'token') {
-              // 普通模式的流式token
               if (workflowSections.value.length === 0) {
-                // 如果不是工作流模式，创建一个默认区块
                 if (!currentSection) {
                   currentSection = {
                     step: 'chat',
@@ -630,11 +611,8 @@ const handleSend = async () => {
               }
               
             } else if (data.type === 'done') {
-              // 完成
               workflowDone.value = true
               isAITyping.value = false
-              
-              // 刷新消息列表
               await chatStore.fetchMessages(chatStore.currentConversationId)
               scrollToBottom()
               
@@ -656,9 +634,7 @@ const handleSend = async () => {
   } catch (error) {
     console.error('发送消息失败:', error)
     ElMessage.error('发送失败，请重试')
-    // 恢复输入内容
     inputValue.value = content
-    attachments.value = currentAttachments
     isAITyping.value = false
     workflowDone.value = true
   } finally {
@@ -688,7 +664,7 @@ const handleFileChange = async (file) => {
   try {
     const uploadedFile = await uploadFile(file.raw)
     
-    attachments.value.push({
+    conversationAttachments.value.push({
       id: Date.now() + Math.random(),
       filename: uploadedFile.filename,
       original_filename: uploadedFile.original_filename,
@@ -696,11 +672,6 @@ const handleFileChange = async (file) => {
       mime_type: uploadedFile.mime_type,
       file_path: uploadedFile.file_path
     })
-    
-    // 如果添加了附件，自动切换到附件模式
-    if (chatMode.value === 'normal') {
-      chatMode.value = 'attachment'
-    }
     
     ElMessage.success('文件上传成功')
   } catch (error) {
@@ -711,10 +682,12 @@ const handleFileChange = async (file) => {
 
 // 移除附件
 const removeAttachment = (id) => {
-  attachments.value = attachments.value.filter(att => att.id !== id)
-  if (attachments.value.length === 0 && chatMode.value === 'attachment') {
-    chatMode.value = 'normal'
-  }
+  conversationAttachments.value = conversationAttachments.value.filter(att => att.id !== id)
+}
+
+// 清除全部附件
+const clearAllAttachments = () => {
+  conversationAttachments.value = []
 }
 
 // 格式化文件大小
@@ -729,6 +702,7 @@ const getCurrentChatTitle = () => {
   const chat = chatStore.conversations.find(c => c.id === chatStore.currentConversationId)
   return chat ? chat.title : '新对话'
 }
+
 // 格式化时间
 const formatTime = (timestamp) => {
   if (!timestamp) return ''
@@ -754,12 +728,6 @@ const formatTime = (timestamp) => {
   height: 100vh;
   display: flex;
   background-color: #f5f5f5;
-}
-
-.main-content {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
 }
 
 .sidebar {
@@ -812,10 +780,6 @@ const formatTime = (timestamp) => {
 
 .new-chat-btn {
   width: 100%;
-}
-
-.new-chat-icon-btn {
-  width: auto;
 }
 
 .sidebar.collapsed .sidebar-header {
@@ -882,6 +846,7 @@ const formatTime = (timestamp) => {
 .chat-item-text {
   flex: 1;
   min-width: 0;
+  text-align: left;
 }
 
 .sidebar.collapsed .chat-item-text {
@@ -994,20 +959,25 @@ const formatTime = (timestamp) => {
   min-width: 0;
 }
 
+.chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  background: white;
+  border-bottom: 1px solid #e0e0e0;
+}
 
-.toggle-sidebar-btn {
-  padding: 8px;
-  border-radius: 8px;
-  cursor: pointer;
-  transition: background-color 0.2s;
+.chat-header h1 {
+  margin: 0;
+  font-size: 18px;
+  text-align: left;
+}
+
+.multi-source-toggle {
   display: flex;
   align-items: center;
 }
-
-.toggle-sidebar-btn:hover {
-  background-color: #f0f0f0;
-}
-
 
 .chat-main {
   flex: 1;
@@ -1088,6 +1058,7 @@ const formatTime = (timestamp) => {
   padding: 12px 16px;
   border-radius: 16px;
   word-wrap: break-word;
+  text-align: left;
 }
 
 .user-bubble {
@@ -1113,22 +1084,6 @@ const formatTime = (timestamp) => {
   display: flex;
   flex-direction: column;
   gap: 4px;
-}
-
-
-.chat-header {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 16px 24px;
-  background: white;
-  border-bottom: 1px solid #e0e0e0;
-}
-
-.chat-header h1 {
-  flex: 1;
-  margin: 0;
-  font-size: 18px;
 }
 
 /* 工作流区块样式 */
@@ -1254,7 +1209,6 @@ const formatTime = (timestamp) => {
   }
 }
 
-/* 其他样式保持不变 */
 .message-text :deep(h1),
 .message-text :deep(h2),
 .message-text :deep(h3) {
@@ -1268,7 +1222,6 @@ const formatTime = (timestamp) => {
   border-radius: 4px;
   font-family: monospace;
 }
-
 
 .chat-footer {
   background-color: white;
@@ -1284,9 +1237,23 @@ const formatTime = (timestamp) => {
 
 .attachments-preview {
   margin-bottom: 12px;
+  padding: 12px;
+  background: #f5f7fa;
+  border-radius: 8px;
+}
+
+.attachments-header {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 14px;
+  color: #606266;
+}
+
+.attachments-preview .el-tag {
+  margin-right: 8px;
+  margin-bottom: 8px;
 }
 
 .input-area {
@@ -1307,7 +1274,7 @@ const formatTime = (timestamp) => {
 }
 
 .custom-textarea {
-  width: 98%;
+  width: calc(100% - 20px);
   border: none;
   outline: none;
   resize: none;
