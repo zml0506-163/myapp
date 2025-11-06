@@ -1,7 +1,8 @@
 """
-多源检索工作流 - V2
-输出格式优化：区分日志(log)和结果(result)
-只有结果会保存到数据库
+工作流服务 V3 - 优化版本
+- 使用独立的提示词模块
+- 使用优化的检索服务
+- 流程更清晰
 """
 import os
 import json
@@ -12,7 +13,8 @@ from sqlalchemy import select, func
 from app.core.config import settings
 from app.db.database import get_db_session
 from app.services.llm_service import llm_service
-from app.services.search_workflow_service import search_service
+from app.services.search_service import optimized_search_service
+from app.prompts.workflow_prompts import WorkflowPrompts
 from app.models import WorkflowExecution, Message, MessageType
 from app.crud import message as crud_message
 from app.schemas.message import MessageCreateSchema
@@ -25,8 +27,6 @@ class WorkflowState(TypedDict):
     user_query: str
     user_attachments: List[Dict]
     history_messages: List[Dict]
-
-    # 步骤结果（存储）
     patient_features: str
     pubmed_query: str
     clinical_trial_keywords: str
@@ -35,14 +35,15 @@ class WorkflowState(TypedDict):
     paper_analyses: List[Dict]
     trial_analysis: str
     final_answer: str
-
-    # 流程控制
     current_step: str
     errors: List[str]
 
 
-class MultiSourceWorkflowV2:
-    """多源检索工作流 V2 - 优化输出格式"""
+class WorkflowService:
+    """优化的工作流服务"""
+
+    def __init__(self):
+        self.prompts = WorkflowPrompts()
 
     async def execute_with_streaming(
             self,
@@ -51,33 +52,10 @@ class MultiSourceWorkflowV2:
             user_query: str,
             user_attachments: List[Dict] = None
     ) -> AsyncGenerator[Dict, None]:
-        """
-        执行工作流并流式输出
-
-        输出格式:
-        - type='log': 过程日志，不保存
-        - type='result': 步骤结果，保存到最终报告
-        - type='section_start': 区块开始标记
-        - type='section_end': 区块结束标记
-        - type='done': 完成标记
-        """
+        """执行工作流并流式输出"""
 
         # 创建执行记录
-        execution_id = None
-        async with get_db_session() as db:
-            execution = WorkflowExecution(
-                conversation_id=conversation_id,
-                user_id=user_id,
-                workflow_type='multi_source',
-                status='running',
-                current_step='initializing'
-            )
-            db.add(execution)
-            await db.commit()
-            execution_id = execution.id
-
-        # 加载历史对话
-        history_messages = await self._load_history(conversation_id)
+        execution_id = await self._create_execution(conversation_id, user_id)
 
         # 初始化状态
         state: WorkflowState = {
@@ -85,7 +63,7 @@ class MultiSourceWorkflowV2:
             'user_id': user_id,
             'user_query': user_query,
             'user_attachments': user_attachments or [],
-            'history_messages': history_messages,
+            'history_messages': await self._load_history(conversation_id),
             'patient_features': '',
             'pubmed_query': '',
             'clinical_trial_keywords': '',
@@ -99,54 +77,39 @@ class MultiSourceWorkflowV2:
         }
 
         try:
-            # 步骤1: 提取患者特征
+            # 执行步骤
             async for chunk in self._step_extract_features(state):
                 yield chunk
 
-            # 步骤2: 生成检索条件
             async for chunk in self._step_generate_queries(state):
                 yield chunk
 
-            # 步骤3: 多源检索
             async for chunk in self._step_search(state):
                 yield chunk
 
-            # 步骤4: 分析文献
             async for chunk in self._step_analyze_papers(state):
                 yield chunk
 
-            # 步骤5: 分析临床试验
             async for chunk in self._step_analyze_trials(state):
                 yield chunk
 
-            # 步骤6: 生成最终报告
             async for chunk in self._step_generate_final(state):
                 yield chunk
 
-            # 保存最终结果
-            await self._save_final_result(state, execution_id)
+            # 保存结果
+            await self._save_result(state, execution_id)
 
-            # 更新执行记录
-            async with get_db_session() as db:
-                execution = await db.get(WorkflowExecution, execution_id)
-                execution.status = 'completed'
-                execution.completed_at = func.now()
-                await db.commit()
+            # 更新执行状态
+            await self._update_execution(execution_id, 'completed')
 
             yield {'type': 'done', 'content': ''}
 
         except Exception as e:
-            # 记录错误
-            async with get_db_session() as db:
-                execution = await db.get(WorkflowExecution, execution_id)
-                execution.status = 'failed'
-                execution.error_message = str(e)
-                await db.commit()
-
+            await self._update_execution(execution_id, 'failed', str(e))
             yield {
                 'type': 'error',
                 'step': state.get('current_step', 'unknown'),
-                'content': f'❌ 工作流执行失败: {str(e)}'
+                'content': f'❌ 执行失败: {str(e)}'
             }
 
     async def _step_extract_features(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
@@ -175,30 +138,16 @@ class MultiSourceWorkflowV2:
 
         context = "\n".join(context_parts)
 
-        prompt = f"""{context}
-
-### 当前用户问题
-{state['user_query']}
-
-### 任务
-请从以上信息中提取患者的关键特征，包括：
-1. **主要疾病/诊断**
-2. **病理类型和分期**
-3. **基因突变信息**
-4. **既往治疗史**
-5. **当前状态和需求**
-
-请以结构化、清晰的方式列出这些信息。"""
-
+        # 使用提示词模板
+        prompt = self.prompts.extract_features(context, state['user_query'])
         messages = [{"role": "user", "content": prompt}]
 
-        # 检查是否有图片附件
+        # 检查是否有图片
         image_attachments = [att for att in state['user_attachments']
                              if att.get('mime_type', '').startswith('image/')]
 
         full_response = ""
 
-        # 日志: 开始分析
         yield {
             'type': 'log',
             'step': 'extract_features',
@@ -220,7 +169,6 @@ class MultiSourceWorkflowV2:
 
             state['patient_features'] = full_response
 
-            # 结果: 提取的特征
             yield {
                 'type': 'result',
                 'step': 'extract_features',
@@ -236,10 +184,7 @@ class MultiSourceWorkflowV2:
             }
             state['errors'].append(f'extract_features: {str(e)}')
 
-        yield {
-            'type': 'section_end',
-            'step': 'extract_features'
-        }
+        yield {'type': 'section_end', 'step': 'extract_features'}
 
     async def _step_generate_queries(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
         """步骤2: 生成检索条件"""
@@ -252,26 +197,8 @@ class MultiSourceWorkflowV2:
             'collapsible': True
         }
 
-        prompt = f"""基于以下患者特征，生成精确的检索条件：
-
-### 患者特征
-{state['patient_features']}
-
-### 任务
-请生成以下检索条件：
-1. **PubMed 检索表达式**: 使用布尔运算符（AND、OR），构建精确的检索式
-2. **ClinicalTrials.gov 关键词**: 提取3-5个核心关键词，用逗号分隔
-
-**输出格式（必须严格遵守JSON格式）**:
-```json
-{{
-    "pubmed_query": "检索表达式",
-    "clinical_trial_keywords": "关键词1,关键词2,关键词3"
-}}
-```
-
-只输出JSON，不要有其他内容。"""
-
+        # 使用提示词模板
+        prompt = self.prompts.generate_queries(state['patient_features'])
         messages = [{"role": "user", "content": prompt}]
 
         yield {
@@ -285,7 +212,7 @@ class MultiSourceWorkflowV2:
             async for token in llm_service.chat_stream(messages=messages):
                 full_response += token
 
-            # 解析 JSON
+            # 解析JSON
             start = full_response.find('{')
             end = full_response.rfind('}') + 1
             if start != -1 and end > start:
@@ -295,7 +222,6 @@ class MultiSourceWorkflowV2:
             else:
                 raise ValueError("未找到有效的JSON")
 
-            # 结果: 检索条件
             yield {
                 'type': 'result',
                 'step': 'generate_queries',
@@ -319,13 +245,10 @@ class MultiSourceWorkflowV2:
             state['clinical_trial_keywords'] = state['user_query']
             state['errors'].append(f'generate_queries: {str(e)}')
 
-        yield {
-            'type': 'section_end',
-            'step': 'generate_queries'
-        }
+        yield {'type': 'section_end', 'step': 'generate_queries'}
 
     async def _step_search(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤3: 多源检索"""
+        """步骤3: 执行检索（使用优化的检索服务）"""
         state['current_step'] = 'search'
 
         yield {
@@ -335,36 +258,26 @@ class MultiSourceWorkflowV2:
             'collapsible': True
         }
 
-        limit = settings.max_search_results
         progress_queue = asyncio.Queue()
+        target_count = settings.max_search_results  # 5篇
 
         # 启动检索任务
         async def search_all():
-            # PubMed
-            papers = await search_service.search_pubmed_with_cache(
+            # 检索文献（会自动排序和去重）
+            papers = await optimized_search_service.search_papers_with_ranking(
                 state['pubmed_query'],
-                limit,
+                target_count,
                 progress_queue
             )
-            state['papers'].extend(papers[:limit])
+            state['papers'].extend(papers)
 
-            # Europe PMC
-            if len(state['papers']) < limit:
-                remaining = limit - len(state['papers'])
-                papers = await search_service.search_europepmc_with_cache(
-                    state['pubmed_query'],
-                    remaining,
-                    progress_queue
-                )
-                state['papers'].extend(papers[:remaining])
-
-            # 临床试验
-            trials = await search_service.search_clinical_trials_with_cache(
+            # 检索临床试验（会自动排序）
+            trials = await optimized_search_service.search_trials_with_ranking(
                 state['clinical_trial_keywords'],
-                limit,
+                target_count,
                 progress_queue
             )
-            state['trials'].extend(trials[:limit])
+            state['trials'].extend(trials)
 
             await progress_queue.put({'type': 'DONE'})
 
@@ -377,23 +290,8 @@ class MultiSourceWorkflowV2:
             if isinstance(msg, dict):
                 if msg.get('type') == 'DONE':
                     break
-                elif msg.get('type') == 'log':
-                    # 日志消息
-                    yield {
-                        'type': 'log',
-                        'step': 'search',
-                        'source': msg.get('source'),
-                        'content': msg['content']
-                    }
-                elif msg.get('type') == 'result':
-                    # 结果消息
-                    yield {
-                        'type': 'result',
-                        'step': 'search',
-                        'source': msg.get('source'),
-                        'content': msg['content'],
-                        'data': msg.get('data')
-                    }
+                elif msg.get('type') in ('log', 'result'):
+                    yield msg
 
         await search_task
 
@@ -412,13 +310,10 @@ class MultiSourceWorkflowV2:
             }
         }
 
-        yield {
-            'type': 'section_end',
-            'step': 'search'
-        }
+        yield {'type': 'section_end', 'step': 'search'}
 
     async def _step_analyze_papers(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤4: 分析文献"""
+        """步骤4: 分析文献（使用提示词模板）"""
         state['current_step'] = 'analyze_papers'
 
         yield {
@@ -438,14 +333,11 @@ class MultiSourceWorkflowV2:
             yield {'type': 'section_end', 'step': 'analyze_papers'}
             return
 
-        # 只分析前5篇
-        papers_to_analyze = state['papers'][:5]
-
-        for i, paper in enumerate(papers_to_analyze):
+        for i, paper in enumerate(state['papers']):
             yield {
                 'type': 'log',
                 'step': 'analyze_papers',
-                'content': f'\n📄 分析文献 {i+1}/{len(papers_to_analyze)}: {paper["title"]}\n'
+                'content': f'\n📄 分析文献 {i+1}/{len(state["papers"])}: {paper["title"]}\n'
             }
 
             pdf_path = paper.get('pdf_path')
@@ -457,40 +349,12 @@ class MultiSourceWorkflowV2:
                 }
                 continue
 
-            prompt = f"""请分析这篇PDF文献：
-
-### 患者特征
-{state['patient_features']}
-
-### 用户问题
-{state['user_query']}
-
-### 文献信息
-- **标题**: {paper['title']}
-- **作者**: {paper.get('authors', 'N/A')}
-- **发表日期**: {paper.get('pub_date', 'N/A')}
-
-### 分析任务
-请完成以下分析（基于PDF全文）：
-
-1. **核心内容**: 简要概述研究的主要内容
-2. **相关性评估**: 与患者情况的相关程度（0-100分）
-3. **主要发现**: 列出文献的关键发现和结论
-4. **证据等级**: 评估研究类型和可靠性（如RCT、回顾性研究等）
-5. **临床意义**: 对患者的实际指导价值
-
-**重要输出要求**：
-- 使用Markdown格式输出
-- 关键数据使用**表格**呈现（如疗效数据、副作用发生率等）
-- 表格示例：
-
-| 指标 | 数值 | 说明 |
-|------|------|------|
-| 客观缓解率(ORR) | 70% | 肿瘤明显缩小的患者比例 |
-| 无进展生存期(PFS) | 12个月 | 中位无进展生存期 |
-
-- 使用**加粗**突出重要信息
-- 使用项目列表使内容结构清晰"""
+            # 使用提示词模板
+            prompt = self.prompts.analyze_paper(
+                state['patient_features'],
+                state['user_query'],
+                paper
+            )
 
             analysis = ""
             try:
@@ -506,7 +370,6 @@ class MultiSourceWorkflowV2:
                     'analysis': analysis
                 })
 
-                # 结果: 单篇文献分析
                 yield {
                     'type': 'result',
                     'step': 'analyze_papers',
@@ -534,13 +397,10 @@ class MultiSourceWorkflowV2:
             'summary': f'✅ 文献分析完成（{len(state["paper_analyses"])} 篇）'
         }
 
-        yield {
-            'type': 'section_end',
-            'step': 'analyze_papers'
-        }
+        yield {'type': 'section_end', 'step': 'analyze_papers'}
 
     async def _step_analyze_trials(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤5: 分析临床试验"""
+        """步骤5: 分析临床试验（使用提示词模板）"""
         state['current_step'] = 'analyze_trials'
 
         yield {
@@ -578,24 +438,11 @@ class MultiSourceWorkflowV2:
 """
             trials_text.append(trial_info)
 
-        prompt = f"""基于患者特征评估以下临床试验：
-
-### 患者特征
-{state['patient_features']}
-
-### 临床试验列表
-{chr(10).join(trials_text)}
-
-### 分析任务
-针对每个试验:
-1. **适配度评分** (0-100分)
-2. **入组标准分析**
-3. **排除标准考量**
-4. **试验优势**
-5. **潜在风险**
-6. **推荐等级**
-
-最后给出综合建议。"""
+        # 使用提示词模板
+        prompt = self.prompts.analyze_trials(
+            state['patient_features'],
+            chr(10).join(trials_text)
+        )
 
         messages = [{"role": "user", "content": prompt}]
 
@@ -609,7 +456,6 @@ class MultiSourceWorkflowV2:
 
             state['trial_analysis'] = analysis
 
-            # 结果: 试验分析
             yield {
                 'type': 'result',
                 'step': 'analyze_trials',
@@ -624,13 +470,10 @@ class MultiSourceWorkflowV2:
                 'content': f'❌ 分析失败: {str(e)}\n'
             }
 
-        yield {
-            'type': 'section_end',
-            'step': 'analyze_trials'
-        }
+        yield {'type': 'section_end', 'step': 'analyze_trials'}
 
     async def _step_generate_final(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤6: 生成最终报告"""
+        """步骤6: 生成最终报告（使用提示词模板）"""
         state['current_step'] = 'generate_final'
 
         yield {
@@ -652,27 +495,13 @@ class MultiSourceWorkflowV2:
             summary = f"**文献 {i+1}**: {item['paper']['title']} - {item['analysis'][:200]}..."
             papers_summary.append(summary)
 
-        prompt = f"""请基于所有分析生成一份专业医疗咨询报告：
-
-### 原始问题
-{state['user_query']}
-
-### 患者特征
-{state['patient_features'][:500]}...
-
-### 文献分析（{len(state['paper_analyses'])} 篇）
-{chr(10).join(papers_summary) if papers_summary else "暂无"}
-
-### 临床试验分析（{len(state['trials'])} 个）
-{state['trial_analysis'][:500] if state['trial_analysis'] else "暂无"}...
-
-### 报告要求
-生成结构化报告，包含：
-1. **执行摘要**
-2. **治疗方案建议**
-3. **临床试验推荐**
-4. **注意事项**
-5. **后续行动建议**"""
+        # 使用提示词模板
+        prompt = self.prompts.generate_final_report(
+            state['user_query'],
+            state['patient_features'],
+            chr(10).join(papers_summary) if papers_summary else "暂无",
+            state['trial_analysis']
+        )
 
         messages = [{"role": "user", "content": prompt}]
 
@@ -683,7 +512,6 @@ class MultiSourceWorkflowV2:
 
             state['final_answer'] = final_answer
 
-            # 结果: 最终报告
             yield {
                 'type': 'result',
                 'step': 'generate_final',
@@ -698,10 +526,32 @@ class MultiSourceWorkflowV2:
                 'content': f'❌ 生成失败: {str(e)}\n'
             }
 
-        yield {
-            'type': 'section_end',
-            'step': 'generate_final'
-        }
+        yield {'type': 'section_end', 'step': 'generate_final'}
+
+    async def _create_execution(self, conversation_id: int, user_id: int) -> int:
+        """创建执行记录"""
+        async with get_db_session() as db:
+            execution = WorkflowExecution(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                workflow_type='multi_source',
+                status='running',
+                current_step='initializing'
+            )
+            db.add(execution)
+            await db.commit()
+            return execution.id
+
+    async def _update_execution(self, execution_id: int, status: str, error: str = None):
+        """更新执行状态"""
+        async with get_db_session() as db:
+            execution = await db.get(WorkflowExecution, execution_id)
+            execution.status = status
+            if status == 'completed':
+                execution.completed_at = func.now()
+            if error:
+                execution.error_message = error
+            await db.commit()
 
     async def _load_history(self, conversation_id: int) -> List[Dict]:
         """加载历史对话"""
@@ -722,10 +572,9 @@ class MultiSourceWorkflowV2:
                 for m in reversed(list(messages))
             ]
 
-    async def _save_final_result(self, state: WorkflowState, execution_id: int):
-        """保存最终结果到数据库（只保存结果，不保存日志）"""
+    async def _save_result(self, state: WorkflowState, execution_id: int):
+        """保存最终结果"""
         async with get_db_session() as db:
-            # 构建完整的最终报告
             full_content = f"""# 多源检索分析报告
 
 ## 1. 患者特征分析
@@ -748,7 +597,6 @@ class MultiSourceWorkflowV2:
 ## 4. 文献分析
 """
 
-            # 添加文献分析
             if state['paper_analyses']:
                 for i, item in enumerate(state['paper_analyses']):
                     full_content += f"\n### 文献 {i+1}: {item['paper']['title']}\n\n"
@@ -756,17 +604,14 @@ class MultiSourceWorkflowV2:
             else:
                 full_content += "\n暂无文献分析\n\n---\n"
 
-            # 添加试验分析
             full_content += f"\n## 5. 临床试验分析\n\n"
             if state['trial_analysis']:
                 full_content += f"{state['trial_analysis']}\n\n---\n"
             else:
                 full_content += "\n暂无临床试验分析\n\n---\n"
 
-            # 添加最终报告
             full_content += f"\n## 6. 综合报告\n\n{state['final_answer']}\n"
 
-            # 保存为消息
             message_schema = MessageCreateSchema(
                 conversation_id=state['conversation_id'],
                 content=full_content,
@@ -780,7 +625,6 @@ class MultiSourceWorkflowV2:
                 user_id=state['user_id']
             )
 
-            # 更新执行记录
             execution = await db.get(WorkflowExecution, execution_id)
             execution.result_message_id = saved_message['id']
             execution.patient_features = state['patient_features']
@@ -792,4 +636,4 @@ class MultiSourceWorkflowV2:
 
 
 # 全局实例
-workflow_service_v2 = MultiSourceWorkflowV2()
+workflow_service = WorkflowService()

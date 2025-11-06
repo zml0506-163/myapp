@@ -9,7 +9,7 @@ from app.db.database import get_db_session
 from app.models import User
 from app.api.deps import get_current_active_user
 from app.services.llm_service import llm_service
-from app.services.workflow_service_v2 import workflow_service_v2
+from app.services.workflow_service import workflow_service
 from app.crud import message as crud_message, conversation as crud_conversation
 from app.schemas.message import MessageCreateSchema
 from app.models import MessageType
@@ -86,7 +86,7 @@ async def chat_stream(
 
             if actual_mode == "multi_source":
                 # === 模式1: 多源检索工作流 ===
-                async for output in workflow_service_v2.execute_with_streaming(
+                async for output in workflow_service.execute_with_streaming(
                         conversation_id=request.conversation_id,
                         user_id=current_user.id,
                         user_query=request.content,
