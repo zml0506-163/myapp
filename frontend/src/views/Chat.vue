@@ -141,15 +141,34 @@
             </div>
 
             <div class="message-content">
-              <div :class="['message-bubble', message.message_type === 'user' ? 'user-bubble' : 'assistant-bubble']">
-                <div class="message-text" v-html="renderMarkdown(message.content)"></div>
+              <!-- 用户消息：保留换行 -->
+              <div v-if="message.message_type === 'user'" class="message-bubble user-bubble">
+                <div class="message-text user-text">{{ message.content }}</div>
                 
                 <!-- 附件显示 -->
                 <div v-if="message.attachments && message.attachments.length > 0" class="message-attachments">
                   <el-tag
                     v-for="att in message.attachments"
                     :key="att.id"
-                    :type="message.message_type === 'user' ? 'info' : 'success'"
+                    type="info"
+                    size="small"
+                  >
+                    <el-icon style="margin-right: 4px"><Paperclip /></el-icon>
+                    {{ att.original_filename }}
+                  </el-tag>
+                </div>
+              </div>
+              
+              <!-- AI消息：渲染Markdown -->
+              <div v-else class="message-bubble assistant-bubble">
+                <div class="message-text assistant-text" v-html="renderMarkdown(message.content)"></div>
+                
+                <!-- 附件显示 -->
+                <div v-if="message.attachments && message.attachments.length > 0" class="message-attachments">
+                  <el-tag
+                    v-for="att in message.attachments"
+                    :key="att.id"
+                    type="success"
                     size="small"
                   >
                     <el-icon style="margin-right: 4px"><Paperclip /></el-icon>
@@ -169,6 +188,7 @@
               <div class="message-bubble assistant-bubble">
                 <!-- 渲染工作流区块 -->
                 <div v-for="(section, idx) in workflowSections" :key="idx" class="workflow-section">
+                  <div v-for="(section, idx) in workflowSections" :key="idx" class="workflow-section">
                   <!-- 区块标题 -->
                   <div class="section-header" @click="section.collapsed = !section.collapsed">
                     <el-icon :class="['collapse-icon', { collapsed: section.collapsed }]">
@@ -180,25 +200,26 @@
                   
                   <!-- 区块内容 -->
                   <div v-show="!section.collapsed" class="section-content">
-                    <!-- 日志 -->
+                    <!-- 日志 - 使用 span 标签，inline 显示 -->
                     <div v-if="section.logs.length > 0" class="logs-container">
-                      <div
+                      <span
                         v-for="(log, logIdx) in section.logs"
                         :key="logIdx"
                         :class="['log-item', `log-source-${log.source || 'default'}`]"
                         v-html="log.content"
-                      ></div>
+                      ></span>
                     </div>
                     
-                    <!-- 结果 -->
+                    <!-- 结果 - Markdown渲染 -->
                     <div v-if="section.results.length > 0" class="results-container">
                       <div
                         v-for="(result, resultIdx) in section.results"
                         :key="resultIdx"
-                        class="result-item"
+                        class="result-item assistant-text"
                         v-html="renderMarkdown(result.content)"
                       ></div>
                     </div>
+                  </div>
                   </div>
                 </div>
                 
@@ -303,7 +324,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick, onMounted, watch } from 'vue'
+import { ref, reactive, nextTick, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
@@ -334,7 +355,7 @@ const chatStore = useChatStore()
 
 // 状态
 const inputValue = ref('')
-const conversationAttachments = ref([])  // 当前会话的附件
+const conversationAttachments = ref([])
 const sidebarOpen = ref(true)
 const chatMainRef = ref(null)
 const uploadRef = ref(null)
@@ -345,9 +366,9 @@ const renamingChatId = ref(null)
 const isRenaming = ref(false)
 const isSending = ref(false)
 const isAITyping = ref(false)
-const enableMultiSource = ref(false)  // 多源检索开关
+const enableMultiSource = ref(false)
 const workflowDone = ref(false)
-const workflowSections = ref([])
+const workflowSections = reactive([])  // 改用 reactive
 
 // 监听对话切换，清空附件
 watch(() => chatStore.currentConversationId, () => {
@@ -508,7 +529,7 @@ const handleSend = async () => {
   isSending.value = true
   isAITyping.value = true
   workflowDone.value = false
-  workflowSections.value = []
+  workflowSections.length = 0  // 清空数组（reactive方式）
   
   try {
     // 发送用户消息
@@ -564,7 +585,7 @@ const handleSend = async () => {
                 results: [],
                 summary: ''
               }
-              workflowSections.value.push(currentSection)
+              workflowSections.push(currentSection)
               
             } else if (data.type === 'section_end') {
               if (currentSection && currentSection.collapsible) {
@@ -574,9 +595,24 @@ const handleSend = async () => {
               
             } else if (data.type === 'log') {
               if (currentSection) {
-                currentSection.logs.push({
-                  content: data.content,
-                  source: data.source
+                // 如果是追加到上一条日志（newline=false）
+                if (data.newline === false && currentSection.logs.length > 0) {
+                  const lastLogIndex = currentSection.logs.length - 1
+                  // 关键：创建新对象，触发Vue响应式更新
+                  currentSection.logs[lastLogIndex] = {
+                    ...currentSection.logs[lastLogIndex],
+                    content: currentSection.logs[lastLogIndex].content + data.content
+                  }
+                } else {
+                  // 新建一条日志
+                  currentSection.logs.push({
+                    content: data.content,
+                    source: data.source
+                  })
+                }
+                // 强制更新（确保实时渲染）
+                nextTick(() => {
+                  scrollToBottom()
                 })
               }
               
@@ -594,7 +630,8 @@ const handleSend = async () => {
               }
               
             } else if (data.type === 'token') {
-              if (workflowSections.value.length === 0) {
+              // 普通聊天模式：逐字追加
+              if (workflowSections.length === 0) {
                 if (!currentSection) {
                   currentSection = {
                     step: 'chat',
@@ -605,9 +642,18 @@ const handleSend = async () => {
                     results: [{ content: '', data: null }],
                     summary: ''
                   }
-                  workflowSections.value.push(currentSection)
+                  workflowSections.push(currentSection)
                 }
-                currentSection.results[0].content += data.content
+                // 逐字追加
+                const resultIndex = currentSection.results.length - 1
+                currentSection.results[resultIndex] = {
+                  ...currentSection.results[resultIndex],
+                  content: currentSection.results[resultIndex].content + data.content
+                }
+                // 强制更新
+                nextTick(() => {
+                  scrollToBottom()
+                })
               }
               
             } else if (data.type === 'done') {
@@ -723,13 +769,19 @@ const formatTime = (timestamp) => {
 </script>
 
 <style scoped>
-/* 基础样式 */
+/* ============================================
+   基础容器样式
+   ============================================ */
 .chat-container {
   height: 100vh;
   display: flex;
   background-color: #f5f5f5;
+  font-size: 14px;
 }
 
+/* ============================================
+   侧边栏样式
+   ============================================ */
 .sidebar {
   width: 280px;
   background-color: #1a1a1a;
@@ -951,6 +1003,9 @@ const formatTime = (timestamp) => {
   padding: 8px 4px;
 }
 
+/* ============================================
+   主内容区域
+   ============================================ */
 .main-content {
   flex: 1;
   display: flex;
@@ -982,7 +1037,7 @@ const formatTime = (timestamp) => {
 .chat-main {
   flex: 1;
   overflow-y: auto;
-  padding: 24px 32px;
+  padding: 20px 24px;
 }
 
 .chat-main::-webkit-scrollbar {
@@ -1007,10 +1062,13 @@ const formatTime = (timestamp) => {
   width: 100%;
 }
 
+/* ============================================
+   消息气泡样式
+   ============================================ */
 .message-item {
   display: flex;
-  gap: 12px;
-  margin-bottom: 24px;
+  gap: 10px;
+  margin-bottom: 14px;
 }
 
 .user-message {
@@ -1022,8 +1080,8 @@ const formatTime = (timestamp) => {
 }
 
 .avatar {
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   display: flex;
   align-items: center;
@@ -1055,10 +1113,12 @@ const formatTime = (timestamp) => {
 
 .message-bubble {
   display: inline-block;
-  padding: 12px 16px;
-  border-radius: 16px;
+  padding: 10px 14px;
+  border-radius: 10px;
   word-wrap: break-word;
   text-align: left;
+  font-size: 14px;
+  line-height: 1.5;
 }
 
 .user-bubble {
@@ -1069,14 +1129,20 @@ const formatTime = (timestamp) => {
 .assistant-bubble {
   background-color: white;
   color: #303133;
-  border: 1px solid #e0e0e0;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+  border: 1px solid #e4e7ed;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 
-.message-text {
-  margin: 0;
+/* 用户消息文本：保留换行，使用 pre-wrap */
+.user-text {
   white-space: pre-wrap;
-  line-height: 1.6;
+  word-break: break-word;
+}
+
+/* AI消息文本：Markdown渲染，使用 normal */
+.assistant-text {
+  white-space: normal;
+  word-break: break-word;
 }
 
 .message-attachments {
@@ -1086,11 +1152,140 @@ const formatTime = (timestamp) => {
   gap: 4px;
 }
 
-/* 工作流区块样式 */
+/* ============================================
+   Markdown 内容样式（仅AI消息）
+   ============================================ */
+.assistant-text :deep(h1),
+.assistant-text :deep(h2),
+.assistant-text :deep(h3),
+.assistant-text :deep(h4) {
+  margin-top: 10px;
+  margin-bottom: 6px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.assistant-text :deep(h1) {
+  font-size: 1.5em;
+}
+
+.assistant-text :deep(h2) {
+  font-size: 1.3em;
+}
+
+.assistant-text :deep(h3) {
+  font-size: 1.15em;
+}
+
+.assistant-text :deep(h4) {
+  font-size: 1em;
+}
+
+.assistant-text :deep(p) {
+  margin: 5px 0;
+  line-height: 1.6;
+}
+
+.assistant-text :deep(ul),
+.assistant-text :deep(ol) {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+.assistant-text :deep(li) {
+  margin: 3px 0;
+  line-height: 1.5;
+}
+
+.assistant-text :deep(code) {
+  background: #f5f5f5;
+  padding: 2px 5px;
+  border-radius: 3px;
+  font-family: 'Courier New', 'Consolas', monospace;
+  font-size: 0.9em;
+  color: #e6426a;
+}
+
+.assistant-text :deep(pre) {
+  background: #f5f5f5;
+  padding: 10px;
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 0.85em;
+  line-height: 1.4;
+  margin: 8px 0;
+}
+
+.assistant-text :deep(pre code) {
+  background: none;
+  padding: 0;
+  color: inherit;
+  font-size: 1em;
+}
+
+.assistant-text :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: 0.9em;
+  background: white;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.assistant-text :deep(table th) {
+  background: #f5f7fa;
+  color: #606266;
+  font-weight: 600;
+  padding: 6px 8px;
+  text-align: left;
+  border: 1px solid #e4e7ed;
+  font-size: 0.95em;
+}
+
+.assistant-text :deep(table td) {
+  padding: 6px 8px;
+  border: 1px solid #e4e7ed;
+  color: #303133;
+  line-height: 1.4;
+}
+
+.assistant-text :deep(table tr:hover) {
+  background: #fafbfc;
+}
+
+.assistant-text :deep(blockquote) {
+  border-left: 3px solid #409eff;
+  padding: 6px 12px;
+  margin: 8px 0;
+  background: #f4f8fb;
+  color: #606266;
+  font-style: italic;
+}
+
+.assistant-text :deep(a) {
+  color: #409eff;
+  text-decoration: none;
+}
+
+.assistant-text :deep(a:hover) {
+  text-decoration: underline;
+}
+
+.assistant-text :deep(strong) {
+  font-weight: 600;
+}
+
+.assistant-text :deep(em) {
+  font-style: italic;
+}
+
+/* ============================================
+   工作流区块样式
+   ============================================ */
 .workflow-section {
-  margin: 16px 0;
-  border: 1px solid #e0e0e0;
-  border-radius: 8px;
+  margin: 8px 0;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
   overflow: hidden;
   background: white;
 }
@@ -1098,20 +1293,22 @@ const formatTime = (timestamp) => {
 .section-header {
   display: flex;
   align-items: center;
-  padding: 12px 16px;
+  padding: 8px 12px;
   background: #f5f7fa;
   cursor: pointer;
   user-select: none;
-  transition: background 0.2s;
+  transition: background 0.15s;
+  font-size: 13px;
 }
 
 .section-header:hover {
-  background: #e8ebf0;
+  background: #ecf0f5;
 }
 
 .collapse-icon {
-  transition: transform 0.2s;
-  margin-right: 8px;
+  transition: transform 0.15s;
+  margin-right: 6px;
+  font-size: 14px;
 }
 
 .collapse-icon.collapsed {
@@ -1125,33 +1322,37 @@ const formatTime = (timestamp) => {
 .section-title {
   font-weight: 600;
   color: #303133;
-  margin-right: 12px;
+  margin-right: 10px;
+  font-size: 13px;
 }
 
 .section-summary {
   color: #67c23a;
-  font-size: 14px;
+  font-size: 12px;
 }
 
 .section-content {
-  padding: 16px;
+  padding: 10px 12px;
 }
 
-/* 日志样式 */
+/* 日志容器：紧凑、inline 显示 */
 .logs-container {
-  margin-bottom: 12px;
-  padding: 12px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
   background: #f9fafb;
-  border-radius: 6px;
-  font-family: 'Courier New', monospace;
-  font-size: 13px;
-  max-height: 300px;
+  border-radius: 4px;
+  font-family: 'Courier New', 'Consolas', monospace;
+  font-size: 12px;
+  max-height: 250px;
   overflow-y: auto;
+  line-height: 1.4;
 }
 
 .log-item {
   color: #606266;
-  line-height: 1.6;
+  display: inline;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .log-source-pubmed {
@@ -1166,20 +1367,125 @@ const formatTime = (timestamp) => {
   color: #e6a23c;
 }
 
-/* 结果样式 */
+/* 结果容器：Markdown渲染 */
 .results-container {
-  line-height: 1.8;
+  line-height: 1.5;
 }
 
 .result-item {
-  margin-bottom: 12px;
+  margin-bottom: 8px;
+}
+
+.result-item :deep(h1),
+.result-item :deep(h2),
+.result-item :deep(h3),
+.result-item :deep(h4) {
+  margin-top: 10px;
+  margin-bottom: 6px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.result-item :deep(h1) {
+  font-size: 1.5em;
+}
+
+.result-item :deep(h2) {
+  font-size: 1.3em;
+}
+
+.result-item :deep(h3) {
+  font-size: 1.15em;
+}
+
+.result-item :deep(h4) {
+  font-size: 1em;
+}
+
+.result-item :deep(p) {
+  margin: 5px 0;
+  line-height: 1.6;
+}
+
+.result-item :deep(ul),
+.result-item :deep(ol) {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+.result-item :deep(li) {
+  margin: 3px 0;
+  line-height: 1.5;
+}
+
+.result-item :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: 0.9em;
+  background: white;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.result-item :deep(table th) {
+  background: #f5f7fa;
+  color: #606266;
+  font-weight: 600;
+  padding: 6px 8px;
+  text-align: left;
+  border: 1px solid #e4e7ed;
+}
+
+.result-item :deep(table td) {
+  padding: 6px 8px;
+  border: 1px solid #e4e7ed;
+  color: #303133;
+  line-height: 1.4;
+}
+
+.result-item :deep(table tr:hover) {
+  background: #fafbfc;
+}
+
+.result-item :deep(code) {
+  background: #f5f5f5;
+  padding: 2px 5px;
+  border-radius: 3px;
+  font-family: 'Courier New', 'Consolas', monospace;
+  font-size: 0.9em;
+  color: #e6426a;
+}
+
+.result-item :deep(pre) {
+  background: #f5f5f5;
+  padding: 10px;
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 0.85em;
+  line-height: 1.4;
+  margin: 8px 0;
+}
+
+.result-item :deep(pre code) {
+  background: none;
+  padding: 0;
+  color: inherit;
+}
+
+.result-item :deep(blockquote) {
+  border-left: 3px solid #409eff;
+  padding: 6px 12px;
+  margin: 8px 0;
+  background: #f4f8fb;
+  color: #606266;
+  font-style: italic;
 }
 
 /* 正在输入指示器 */
 .typing-indicator {
   display: inline-flex;
   gap: 4px;
-  margin-top: 12px;
+  margin-top: 8px;
 }
 
 .typing-indicator span {
@@ -1209,20 +1515,9 @@ const formatTime = (timestamp) => {
   }
 }
 
-.message-text :deep(h1),
-.message-text :deep(h2),
-.message-text :deep(h3) {
-  margin-top: 16px;
-  margin-bottom: 8px;
-}
-
-.message-text :deep(code) {
-  background: #f5f5f5;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: monospace;
-}
-
+/* ============================================
+   输入区域样式
+   ============================================ */
 .chat-footer {
   background-color: white;
   border-top: 1px solid #e0e0e0;
@@ -1326,6 +1621,9 @@ const formatTime = (timestamp) => {
   color: #909399;
 }
 
+/* ============================================
+   下拉菜单样式
+   ============================================ */
 :deep(.el-dropdown-menu__item) {
   display: flex;
   align-items: center;

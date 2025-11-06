@@ -1,25 +1,27 @@
 import asyncio
 import time
-
 import httpx
 from concurrent.futures import ThreadPoolExecutor
-
 from bs4 import BeautifulSoup
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 from typing import List, Dict, Optional
-
 from metapub import FindIt
-
 from fastapi.logger import logger
-
-from app.tools.download_utils import fetch_sync, download_pdf
-from app.tools.publisher_rules import PUBLISHER_RULES, DEFAULT_RULE, get_pdf_path_from_pmcid
 import xml.etree.ElementTree as ET
 
+from app.tools.publisher_rules import PUBLISHER_RULES, DEFAULT_RULE, get_pdf_path_from_pmcid
 
 # NCBI E-utilities 基础地址
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+# 请求头
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Referer': 'https://pubmed.ncbi.nlm.nih.gov/',
+    'Accept-Language': 'en-US,en;q=0.5'
+}
 
 # -------------------------------
 # PubMed API 部分
@@ -155,17 +157,19 @@ def extract_authors(article) -> str:
 
     return ", ".join(authors)
 
+
 # -------------------------------
 # 爬虫部分：获取 PDF
 # -------------------------------
+
 def find_pdf_links_by_metapub(pmid, max_retries=5, retry_delay=1):
     """
     通过pmid获取PDF链接，当遇到访问频率限制等错误时会自动重试
 
     参数:
         pmid: 文献的PMID编号
-        max_retries: 最大重试次数，默认3次
-        retry_delay: 重试间隔时间(秒)，默认5秒
+        max_retries: 最大重试次数，默认5次
+        retry_delay: 重试间隔时间(秒)，默认1秒
 
     返回:
         str: PDF下载链接，如果获取失败则返回None
@@ -192,52 +196,129 @@ def find_pdf_links_by_metapub(pmid, max_retries=5, retry_delay=1):
     return None
 
 
-def get_pdf_from_pubmed_sync(pmid: str, pmcid: str, progress_callback) -> Path | None:
+def fetch_sync(url: str) -> str:
+    """同步获取网页内容（带超时控制）"""
+    import requests
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        if resp.status_code != 200:
+            raise Exception(f"请求失败: {resp.status_code}")
+        resp.encoding = "utf-8"
+        return resp.text
+    except requests.Timeout:
+        raise Exception(f"获取页面超时（30秒）")
+    except Exception as e:
+        raise Exception(f"获取页面失败: {str(e)}")
+
+
+def download_pdf_sync(pdf_link: str, pmid: str, url_type: str,
+                      download_selector: str, page_wait_selector: str,
+                      progress_callback) -> Optional[Path]:
+    """
+    同步下载PDF（根据url_type选择下载方式）
+
+    Args:
+        pdf_link: PDF链接
+        pmid: PMID编号
+        url_type: 'pdf' | 'tgz' | 'webview'
+        download_selector: 网页下载按钮选择器（仅webview需要）
+        page_wait_selector: 页面等待选择器（仅webview需要）
+        progress_callback: 进度回调函数
+    """
+    # 导入下载工具（这里使用原来的download_utils）
+    from app.tools.download_utils import (
+        download_pdf_sync as direct_download,
+        download_pdf_from_tgz_sync,
+        download_pdf_from_webview
+    )
+
+    try:
+        progress_callback("发现PDF", False)
+        progress_callback("开始下载...", False)
+
+        if url_type == "tgz":
+            pdf_path = download_pdf_from_tgz_sync(
+                pdf_link,
+                f"{pmid}.pdf",
+                progress_callback
+            )
+        elif url_type == "webview":
+            pdf_path = download_pdf_from_webview(
+                pdf_link,
+                pmid,
+                download_selector,
+                page_wait_selector,
+                progress_callback
+            )
+        else:  # url_type == "pdf"
+            pdf_path = direct_download(
+                pdf_link,
+                f"{pmid}.pdf",
+                progress_callback
+            )
+
+        if pdf_path:
+            progress_callback("下载成功", False)
+        else:
+            progress_callback("下载失败", False)
+
+        return pdf_path
+
+    except Exception as e:
+        logger.error(f"下载PDF时出错: {str(e)}")
+        progress_callback(f"下载异常: {str(e)}", False)
+        return None
+
+
+def get_pdf_from_pubmed_sync(pmid: str, pmcid: str, progress_callback) -> Optional[Path]:
     """同步版本：从PubMed获取PDF并下载"""
     try:
         progress_callback("开始查找PDF资源...", False)
         pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
-        progress_callback(f" 打开 <a target='_blank' href='{pubmed_url}'>{pubmed_url}</a>", False)
+        progress_callback(f"打开 <a target='_blank' href='{pubmed_url}'>{pubmed_url}</a>", False)
+
         html = fetch_sync(pubmed_url)
         soup = BeautifulSoup(html, "html.parser")
 
         links = soup.select("div.full-text-links div.full-text-links-list a")
         if not links:
-            print(f"PMID {pmid} 未发现full text links")
+            logger.info(f"PMID {pmid} 未发现full text links")
+            progress_callback("未发现Full Text Links", False)
             return None
-        progress_callback(", 发现Full Text Links", False)
-        """
-        获取PDF下载地址几种方式：
-        1、查看是否为PMC，如果是可以通过oa.fcgi接口获取pdf下载地址
-        2、通过metapub的FindIt方法获取
-        3、通过full text link的详情页面爬虫获取
-        """
-        # 1、查看是否为PMC，如果是可以通过oa.fcgi接口获取pdf下载地址
+
+        progress_callback("发现Full Text Links", False)
+
+        # 获取PDF下载地址的几种方式：
+        # 1. 查看是否为PMC，如果是可以通过oa.fcgi接口获取pdf下载地址
         if pmcid is not None:
-            progress_callback(f", 发现PMC资源", False)
+            progress_callback("发现PMC资源", False)
             pdf_link = get_pdf_path_from_pmcid(pmcid)
             if pdf_link is not None:
-                url_type = "pdf"
-                if pdf_link.endswith(".tar.gz"):
-                    url_type = "tgz"
-                pdf_path = download_pdf(pmid, pdf_link, progress_callback, url_type, None, None)
-                return pdf_path
-        # 2、通过metapub的FindIt方法获取
+                url_type = "tgz" if pdf_link.endswith(".tar.gz") else "pdf"
+                pdf_path = download_pdf_sync(
+                    pdf_link, pmid, url_type,
+                    None, None, progress_callback
+                )
+                if pdf_path:
+                    return pdf_path
+
+        # 2. 通过metapub的FindIt方法获取
         pdf_link = find_pdf_links_by_metapub(pmid)
-        # pdf_link = FindIt(pmid).url  # 通过FindIt可以获取到pdf下载链接
         if pdf_link:
-            progress_callback(f", 发现PDF资源", False)
-            pdf_path = download_pdf(pmid, pdf_link, progress_callback, "pdf", None, None)
-            return pdf_path
+            progress_callback("发现PDF资源", False)
+            pdf_path = download_pdf_sync(
+                pdf_link, pmid, "pdf",
+                None, None, progress_callback
+            )
+            if pdf_path:
+                return pdf_path
+
+        # 3. 通过full text link的详情页面爬虫获取
         if not pdf_link:
-            # 3、通过full text link的详情页面爬虫获取
             for link in links:
                 full_text_link = link.get("href")
-                # action = link.get("data-ga-action")
-                # if action == "PMC":
-                # 如果还是没有，再通过出版商页面爬虫获取, 爬虫比较容易被人机校验拦截导致访问403
                 publisher_url = urljoin(pubmed_url, full_text_link)
-                progress_callback(f", 访问<a target='_blank' href='{publisher_url}'>出版商页面</a>", False)
+                progress_callback(f"访问<a target='_blank' href='{publisher_url}'>出版商页面</a>", False)
 
                 # 获取域名，选择对应规则
                 domain = urlparse(publisher_url).netloc
@@ -249,37 +330,67 @@ def get_pdf_from_pubmed_sync(pmid: str, pmcid: str, progress_callback) -> Path |
                 else:
                     html2 = ""
 
-                pdf_link, url_type,  download_selector, page_wait_selector = parser(publisher_url, html2)
-                if not pdf_link:
+                result = parser(publisher_url, html2)
+                if not result:
                     continue
-                print(f"PMID {pmid} PDF链接: {pdf_link} url_type:{url_type}")
-                pdf_path = download_pdf(pmid, pdf_link, progress_callback, url_type, download_selector, page_wait_selector)
-                if pdf_path is None:
-                    continue
-                return pdf_path
+
+                pdf_link, url_type, download_selector, page_wait_selector = result
+                logger.info(f"PMID {pmid} PDF链接: {pdf_link} url_type:{url_type}")
+
+                pdf_path = download_pdf_sync(
+                    pdf_link, pmid, url_type,
+                    download_selector, page_wait_selector,
+                    progress_callback
+                )
+
+                if pdf_path:
+                    return pdf_path
+
         return None
+
     except Exception as e:
-        print(f"处理PMID {pmid} 时出错: {str(e)}")
-        progress_callback(f" 下载失败！", False)
+        logger.error(f"处理PMID {pmid} 时出错: {str(e)}")
+        progress_callback("下载失败！", False)
         return None
 
 
-async def get_pdf_from_pubmed(pmid: str, pmcid: str, executor: ThreadPoolExecutor, progress_callback) -> Optional[Path]:
-    """异步接口：使用线程池执行同步函数"""
+async def get_pdf_from_pubmed(
+        pmid: str,
+        pmcid: str,
+        executor: ThreadPoolExecutor,
+        progress_callback
+) -> Optional[Path]:
+    """
+    异步接口：使用线程池执行同步函数（带总超时）
+
+    Args:
+        pmid: PMID编号
+        pmcid: PMCID编号（可选）
+        executor: 线程池执行器
+        progress_callback: 进度回调函数
+
+    Returns:
+        Optional[Path]: 下载成功返回PDF路径，失败返回None
+    """
     loop = asyncio.get_running_loop()
-    # 在线程池中运行同步函数
+
     try:
-        # 在线程池中运行同步函数
-        return await loop.run_in_executor(
-            executor,
-            get_pdf_from_pubmed_sync,
-            pmid,
-            pmcid,
-            progress_callback # progress_callback用于给前端返回SSE结果
+        # 设置总超时时间为 120 秒
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                executor,
+                get_pdf_from_pubmed_sync,
+                pmid,
+                pmcid,
+                progress_callback
+            ),
+            timeout=120.0
         )
-    except Exception as e:
-        # 记录错误并返回None
-        logger.error(f"获取PMID {pmid} 的PDF时出错: {str(e)}")
+    except asyncio.TimeoutError:
+        logger.error(f"获取PMID {pmid} 的PDF超时（120秒）")
+        progress_callback("下载超时（120秒），已跳过", False)
         return None
-
-
+    except Exception as e:
+        logger.error(f"获取PMID {pmid} 的PDF时出错: {str(e)}")
+        progress_callback(f"下载失败: {str(e)}", False)
+        return None
