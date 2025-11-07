@@ -186,40 +186,45 @@
             </div>
             <div class="message-content">
               <div class="message-bubble assistant-bubble">
-                <!-- 渲染工作流区块 -->
-                <div v-for="(section, idx) in workflowSections" :key="`section-${idx}`" class="workflow-section">
-                  <!-- 区块标题 -->
-                  <div class="section-header" @click="toggleSection(idx)">
-                    <el-icon :class="['collapse-icon', { collapsed: section.collapsed }]">
-                      <ArrowRight />
-                    </el-icon>
-                    <span class="section-title">{{ section.title }}</span>
-                    <span v-if="section.summary" class="section-summary">{{ section.summary }}</span>
-                  </div>
-                  
-                  <!-- 区块内容 -->
-                  <div v-show="!section.collapsed" class="section-content">
-                    <!-- 日志 -->
-                    <div v-if="section.logs.length > 0" class="logs-container">
-                      <span
-                        v-for="(log, logIdx) in section.logs"
-                        :key="`log-${idx}-${logIdx}`"
-                        :class="['log-item', `log-source-${log.source || 'default'}`]"
-                        v-html="log.content"
-                      ></span>
+                <!-- ========== 工作流模式：显示区块 ========== -->
+                <div v-if="isWorkflowMode && workflowSections.length > 0">
+                  <div v-for="(section, idx) in workflowSections" :key="`section-${section.step}-${idx}`" class="workflow-section">
+                    <!-- 区块标题 -->
+                    <div class="section-header" @click="toggleSection(idx)">
+                      <el-icon :class="['collapse-icon', { collapsed: section.collapsed }]">
+                        <ArrowRight />
+                      </el-icon>
+                      <span class="section-title">{{ section.title }}</span>
+                      <span v-if="section.summary" class="section-summary">{{ section.summary }}</span>
                     </div>
                     
-                    <!-- 结果 -->
-                    <div v-if="section.results.length > 0" class="results-container">
-                      <div
-                        v-for="(result, resultIdx) in section.results"
-                        :key="`result-${idx}-${resultIdx}`"
-                        class="result-item assistant-text"
-                        v-html="renderMarkdown(result.content)"
-                      ></div>
+                    <!-- 区块内容 -->
+                    <div v-show="!section.collapsed" class="section-content">
+                      <!-- 日志 -->
+                      <div v-if="section.logs.length > 0" class="logs-container">
+                        <span
+                          v-for="(log, logIdx) in section.logs"
+                          :key="`log-${idx}-${logIdx}`"
+                          :class="['log-item', `log-source-${log.source || 'default'}`]"
+                          v-html="log.content"
+                        ></span>
+                      </div>
+                      
+                      <!-- 结果 -->
+                      <div v-if="section.results.length > 0" class="results-container">
+                        <div
+                          v-for="(result, resultIdx) in section.results"
+                          :key="`result-${idx}-${resultIdx}`"
+                          class="result-item assistant-text"
+                          v-html="renderMarkdown(result.content)"
+                        ></div>
+                      </div>
                     </div>
                   </div>
                 </div>
+                
+                <!-- ========== 普通模式：直接显示文本 ========== -->
+                <div v-else-if="!isWorkflowMode && simpleResponse" class="assistant-text" v-html="renderMarkdown(simpleResponse)"></div>
                 
                 <!-- 正在输入指示器 -->
                 <div v-if="!workflowDone" class="typing-indicator">
@@ -380,6 +385,8 @@ const isAITyping = ref(false)
 const enableMultiSource = ref(false)
 const workflowDone = ref(false)
 const workflowSections = ref([])  // 改用 ref
+const simpleResponse = ref('')  // 用于普通模式的纯文本响应
+const isWorkflowMode = ref(false)  //标识当前是否为工作流模式
 const currentReader = ref(null)  // 用于存储当前的 Reader，以便停止
 
 // 监听对话切换，清空附件
@@ -567,10 +574,14 @@ const handleSend = async () => {
   isSending.value = true
   isAITyping.value = true
   workflowDone.value = false
-  workflowSections.value = []  // 清空数组
+  
+  // 清空之前的状态
+  workflowSections.value = []
+  simpleResponse.value = ''
+  isWorkflowMode.value = (mode === 'multi_source')
   
   try {
-    // 刷新发送消息页面样式，不调用后端
+    // 刷新发送消息页面样式
     await chatStore.sendUserMessage(content, conversationAttachments.value)
     scrollToBottom()
     
@@ -578,7 +589,6 @@ const handleSend = async () => {
     const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
     const token = localStorage.getItem('chat_token')
     
-    // chat/stream 接口会自动保存用户消息和AI回复
     const response = await fetch(`${baseURL}/chat/stream`, {
       method: 'POST',
       headers: {
@@ -598,7 +608,7 @@ const handleSend = async () => {
     }
 
     const reader = response.body.getReader()
-    currentReader.value = reader  // 保存 reader 引用
+    currentReader.value = reader
     const decoder = new TextDecoder()
     
     let currentSection = null
@@ -615,6 +625,7 @@ const handleSend = async () => {
           try {
             const data = JSON.parse(line.slice(6))
             
+            // === 工作流模式的事件处理 ===
             if (data.type === 'section_start') {
               currentSection = {
                 step: data.step,
@@ -625,62 +636,106 @@ const handleSend = async () => {
                 results: [],
                 summary: ''
               }
-              workflowSections.value.push(currentSection)
+              workflowSections.value = [...workflowSections.value, currentSection]
               
             } else if (data.type === 'section_end') {
               if (currentSection && currentSection.collapsible) {
-                currentSection.collapsed = true
+                // 使用索引更新，确保响应式
+                const idx = workflowSections.value.findIndex(s => s.step === currentSection.step)
+                if (idx !== -1) {
+                  workflowSections.value[idx] = { ...currentSection, collapsed: true }
+                }
               }
               currentSection = null
               
             } else if (data.type === 'log') {
               if (currentSection) {
-                if (data.newline === false && currentSection.logs.length > 0) {
-                  // 追加到最后一条日志
-                  const lastIdx = currentSection.logs.length - 1
-                  currentSection.logs[lastIdx].content += data.content
-                } else {
-                  // 新建日志
-                  currentSection.logs.push({
-                    content: data.content,
-                    source: data.source
-                  })
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === currentSection.step)
+                if (sectionIdx !== -1) {
+                  const section = workflowSections.value[sectionIdx]
+                  
+                  if (data.newline === false && section.logs.length > 0) {
+                    // 追加到最后一条日志
+                    const lastIdx = section.logs.length - 1
+                    const updatedLogs = [...section.logs]
+                    updatedLogs[lastIdx] = {
+                      ...updatedLogs[lastIdx],
+                      content: updatedLogs[lastIdx].content + data.content
+                    }
+                    workflowSections.value[sectionIdx] = {
+                      ...section,
+                      logs: updatedLogs
+                    }
+                  } else {
+                    // 新建日志
+                    workflowSections.value[sectionIdx] = {
+                      ...section,
+                      logs: [...section.logs, {
+                        content: data.content,
+                        source: data.source
+                      }]
+                    }
+                  }
                 }
               }
               
             } else if (data.type === 'result') {
               if (currentSection) {
-                if (data.content) {
-                  currentSection.results.push({
-                    content: data.content,
-                    data: data.data
-                  })
-                }
-                if (data.summary) {
-                  currentSection.summary = data.summary
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === currentSection.step)
+                if (sectionIdx !== -1) {
+                  const section = workflowSections.value[sectionIdx]
+                  
+                  const updates = {}
+                  if (data.content) {
+                    updates.results = [...section.results, {
+                      content: data.content,
+                      data: data.data
+                    }]
+                  }
+                  if (data.summary) {
+                    updates.summary = data.summary
+                  }
+                  
+                  workflowSections.value[sectionIdx] = {
+                    ...section,
+                    ...updates
+                  }
                 }
               }
               
             } else if (data.type === 'token') {
-              // 普通聊天模式：逐字追加
-              if (workflowSections.value.length === 0 || !currentSection) {
+              // === 普通模式：逐字追加 ===
+              if (isWorkflowMode.value) {
+                // 工作流模式中的 token（最终报告）
                 if (!currentSection) {
                   currentSection = {
-                    step: 'chat',
-                    title: 'AI 回复',
+                    step: 'final_report',
+                    title: '📝 最终报告',
                     collapsible: false,
                     collapsed: false,
                     logs: [],
                     results: [{ content: '', data: null }],
                     summary: ''
                   }
-                  workflowSections.value.push(currentSection)
+                  workflowSections.value = [...workflowSections.value, currentSection]
                 }
-              }
-              
-              // 追加到当前 section 的第一个 result
-              if (currentSection && currentSection.results.length > 0) {
-                currentSection.results[0].content += data.content
+                
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === currentSection.step)
+                if (sectionIdx !== -1 && workflowSections.value[sectionIdx].results.length > 0) {
+                  const section = workflowSections.value[sectionIdx]
+                  const updatedResults = [...section.results]
+                  updatedResults[0] = {
+                    ...updatedResults[0],
+                    content: updatedResults[0].content + data.content
+                  }
+                  workflowSections.value[sectionIdx] = {
+                    ...section,
+                    results: updatedResults
+                  }
+                }
+              } else {
+                // 纯普通模式：直接追加到 simpleResponse
+                simpleResponse.value += data.content
               }
               
             } else if (data.type === 'done') {
@@ -690,17 +745,14 @@ const handleSend = async () => {
               await chatStore.fetchMessages(chatStore.currentConversationId)
               
             } else if (data.type === 'title_updated') {
-              // 处理标题更新事件
               const conversationId = data.conversation_id
               const newTitle = data.title
               
-              // 更新本地 store 中的对话标题
               const conv = chatStore.conversations.find(c => c.id === conversationId)
               if (conv) {
                 conv.title = newTitle
               }
               
-              // 显示提示
               ElMessage.success(`对话已自动重命名为「${newTitle}」`)
               
             } else if (data.type === 'error') {
@@ -709,7 +761,8 @@ const handleSend = async () => {
               workflowDone.value = true
               currentReader.value = null
             }
-            await nextTick();
+            
+            await nextTick()
             scrollToBottom()
             
           } catch (e) {

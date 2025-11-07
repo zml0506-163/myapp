@@ -246,6 +246,7 @@ async def chat_stream(
                                 image_path=att.get('file_path', '')
                         ):
                             ai_content += chunk
+                            # 统一使用 token 类型
                             yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
 
                 elif pdf_attachments:
@@ -309,7 +310,8 @@ async def chat_stream(
 
                 async for chunk in llm_service.chat_stream(messages=messages):
                     ai_content += chunk
-                    yield f"data: {json.dumps({'type': 'result', 'content': chunk}, ensure_ascii=False)}\n\n"
+                    # 统一使用 token 类型
+                    yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
 
                 # 保存 AI 消息
                 async with get_db_session() as db:
@@ -329,14 +331,11 @@ async def chat_stream(
             # === 智能重命名逻辑 ===
             if is_first_conversation and ai_content:
                 try:
-                    # 1. 先判断是否应该生成标题（过滤寒暄）
                     should_rename = await should_generate_title(request.content, ai_content)
 
                     if should_rename:
-                        # 2. 生成标题
                         new_title = await generate_conversation_title(request.content, ai_content)
 
-                        # 3. 更新数据库
                         async with get_db_session() as db:
                             await crud_conversation.update_conversation(
                                 db,
@@ -345,15 +344,33 @@ async def chat_stream(
                                 user_id=current_user.id
                             )
 
-                        # 4. 通知前端更新标题
                         yield f"data: {json.dumps({{'type': 'title_updated', 'conversation_id': request.conversation_id, 'title': new_title}}, ensure_ascii=False)}\n\n"
                     else:
-                        # 寒暄对话，保持"新对话"标题
                         print(f"检测到寒暄对话，保持标题为'新对话'")
 
                 except Exception as e:
                     print(f"自动重命名失败: {e}")
-                    # 重命名失败不影响主流程，静默处理
+
+        except asyncio.CancelledError:
+            if ai_content and actual_mode != "multi_source":
+                async with get_db_session() as db:
+                    ai_message_schema = MessageCreateSchema(
+                        conversation_id=request.conversation_id,
+                        content=ai_content + "\n\n[回答已中断]",
+                        message_type=MessageType.ASSISTANT
+                    )
+                    await crud_message.create_message(
+                        db,
+                        message_schema=ai_message_schema,
+                        user_id=current_user.id
+                    )
+            raise
+
+        except Exception as e:
+            import traceback
+            error_detail = traceback.format_exc()
+            print(f"Chat Error: {error_detail}")
+            yield f"data: {json.dumps({'type': 'error', 'content': f'❌ 错误: {str(e)}'}, ensure_ascii=False)}\n\n"
 
         except asyncio.CancelledError:
             if ai_content and actual_mode != "multi_source":
