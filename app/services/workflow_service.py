@@ -1,8 +1,5 @@
 """
-工作流服务 V3 - 优化版本
-- 使用独立的提示词模块
-- 使用优化的检索服务
-- 流程更清晰
+工作流服务 - 修复逐字打印版本
 """
 import os
 import json
@@ -119,7 +116,7 @@ class WorkflowService:
         yield {
             'type': 'section_start',
             'step': 'extract_features',
-            'title': '提取患者特征',
+            'title': '🔍 提取患者特征',
             'collapsible': True
         }
 
@@ -151,7 +148,9 @@ class WorkflowService:
         yield {
             'type': 'log',
             'step': 'extract_features',
-            'content': '🤔 正在分析患者信息...\n'
+            'source': 'extract_features',
+            'content': '正在分析患者信息...\n',
+            'newline': True
         }
 
         try:
@@ -173,14 +172,16 @@ class WorkflowService:
                 'type': 'result',
                 'step': 'extract_features',
                 'content': full_response,
-                'summary': '✅ 患者特征提取完成'
+                'summary': '✅ 特征提取完成'
             }
 
         except Exception as e:
             yield {
                 'type': 'log',
                 'step': 'extract_features',
-                'content': f'❌ 分析失败: {str(e)}\n'
+                'source': 'extract_features',
+                'content': f'❌ 分析失败: {str(e)}\n',
+                'newline': True
             }
             state['errors'].append(f'extract_features: {str(e)}')
 
@@ -193,18 +194,19 @@ class WorkflowService:
         yield {
             'type': 'section_start',
             'step': 'generate_queries',
-            'title': '生成检索条件',
+            'title': '🔍 生成检索条件',
             'collapsible': True
         }
 
-        # 使用提示词模板
         prompt = self.prompts.generate_queries(state['patient_features'])
         messages = [{"role": "user", "content": prompt}]
 
         yield {
             'type': 'log',
             'step': 'generate_queries',
-            'content': '🔍 正在生成检索条件...\n'
+            'source': 'generate_queries',
+            'content': '正在生成检索条件...\n',
+            'newline': True
         }
 
         full_response = ""
@@ -212,7 +214,6 @@ class WorkflowService:
             async for token in llm_service.chat_stream(messages=messages):
                 full_response += token
 
-            # 解析JSON
             start = full_response.find('{')
             end = full_response.rfind('}') + 1
             if start != -1 and end > start:
@@ -239,31 +240,30 @@ class WorkflowService:
             yield {
                 'type': 'log',
                 'step': 'generate_queries',
-                'content': f'⚠️ 解析失败，使用默认条件: {str(e)}\n'
+                'source': 'generate_queries',
+                'content': f'⚠️ 解析失败，使用默认条件\n',
+                'newline': True
             }
             state['pubmed_query'] = state['user_query']
             state['clinical_trial_keywords'] = state['user_query']
-            state['errors'].append(f'generate_queries: {str(e)}')
 
         yield {'type': 'section_end', 'step': 'generate_queries'}
 
     async def _step_search(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤3: 执行检索（使用优化的检索服务）"""
+        """步骤3: 执行检索"""
         state['current_step'] = 'search'
 
         yield {
             'type': 'section_start',
             'step': 'search',
-            'title': '执行多源检索',
+            'title': '📚 执行多源检索',
             'collapsible': True
         }
 
         progress_queue = asyncio.Queue()
-        target_count = settings.max_search_results  # 5篇
+        target_count = settings.max_search_results
 
-        # 启动检索任务
         async def search_all():
-            # 检索文献（会自动排序和去重）
             papers = await optimized_search_service.search_papers_with_ranking(
                 state['pubmed_query'],
                 target_count,
@@ -271,7 +271,6 @@ class WorkflowService:
             )
             state['papers'].extend(papers)
 
-            # 检索临床试验（会自动排序）
             trials = await optimized_search_service.search_trials_with_ranking(
                 state['clinical_trial_keywords'],
                 target_count,
@@ -283,7 +282,6 @@ class WorkflowService:
 
         search_task = asyncio.create_task(search_all())
 
-        # 处理进度消息
         while True:
             msg = await progress_queue.get()
 
@@ -295,7 +293,6 @@ class WorkflowService:
 
         await search_task
 
-        # 汇总结果
         yield {
             'type': 'result',
             'step': 'search',
@@ -303,7 +300,7 @@ class WorkflowService:
 
 - **文献总数**: {len(state['papers'])} 篇
 - **临床试验**: {len(state['trials'])} 个""",
-            'summary': f'✅ 多源检索完成（{len(state["papers"])} 篇文献，{len(state["trials"])} 个试验）',
+            'summary': f'✅ 检索完成（{len(state["papers"])} 篇文献，{len(state["trials"])} 个试验）',
             'data': {
                 'paper_count': len(state['papers']),
                 'trial_count': len(state['trials'])
@@ -313,13 +310,13 @@ class WorkflowService:
         yield {'type': 'section_end', 'step': 'search'}
 
     async def _step_analyze_papers(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤4: 分析文献（使用提示词模板）"""
+        """步骤4: 分析文献"""
         state['current_step'] = 'analyze_papers'
 
         yield {
             'type': 'section_start',
             'step': 'analyze_papers',
-            'title': '分析文献',
+            'title': '📄 分析文献',
             'collapsible': True
         }
 
@@ -337,7 +334,9 @@ class WorkflowService:
             yield {
                 'type': 'log',
                 'step': 'analyze_papers',
-                'content': f'\n📄 分析文献 {i+1}/{len(state["papers"])}: {paper["title"]}\n'
+                'source': 'analyze_papers',
+                'content': f'\n📄 分析文献 {i+1}/{len(state["papers"])}: {paper["title"]}\n',
+                'newline': True
             }
 
             pdf_path = paper.get('pdf_path')
@@ -345,11 +344,12 @@ class WorkflowService:
                 yield {
                     'type': 'log',
                     'step': 'analyze_papers',
-                    'content': '⚠️ PDF文件不存在，跳过\n'
+                    'source': 'analyze_papers',
+                    'content': '⚠️ PDF不存在，跳过\n',
+                    'newline': True
                 }
                 continue
 
-            # 使用提示词模板
             prompt = self.prompts.analyze_paper(
                 state['patient_features'],
                 state['user_query'],
@@ -387,7 +387,9 @@ class WorkflowService:
                 yield {
                     'type': 'log',
                     'step': 'analyze_papers',
-                    'content': f'❌ 分析失败: {str(e)}\n'
+                    'source': 'analyze_papers',
+                    'content': f'❌ 分析失败: {str(e)}\n',
+                    'newline': True
                 }
 
         yield {
@@ -400,13 +402,13 @@ class WorkflowService:
         yield {'type': 'section_end', 'step': 'analyze_papers'}
 
     async def _step_analyze_trials(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤5: 分析临床试验（使用提示词模板）"""
+        """步骤5: 分析临床试验"""
         state['current_step'] = 'analyze_trials'
 
         yield {
             'type': 'section_start',
             'step': 'analyze_trials',
-            'title': '分析临床试验',
+            'title': '💊 分析临床试验',
             'collapsible': True
         }
 
@@ -423,10 +425,11 @@ class WorkflowService:
         yield {
             'type': 'log',
             'step': 'analyze_trials',
-            'content': f'🤔 正在分析 {len(state["trials"])} 个临床试验...\n'
+            'source': 'analyze_trials',
+            'content': f'正在分析 {len(state["trials"])} 个临床试验...\n',
+            'newline': True
         }
 
-        # 格式化试验信息
         trials_text = []
         for i, trial in enumerate(state['trials']):
             trial_info = f"""### 试验 {i+1}: {trial.get('title')}
@@ -438,10 +441,9 @@ class WorkflowService:
 """
             trials_text.append(trial_info)
 
-        # 使用提示词模板
         prompt = self.prompts.analyze_trials(
             state['patient_features'],
-            chr(10).join(trials_text)
+            '\n'.join(trials_text)
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -467,55 +469,73 @@ class WorkflowService:
             yield {
                 'type': 'log',
                 'step': 'analyze_trials',
-                'content': f'❌ 分析失败: {str(e)}\n'
+                'source': 'analyze_trials',
+                'content': f'❌ 分析失败: {str(e)}\n',
+                'newline': True
             }
 
         yield {'type': 'section_end', 'step': 'analyze_trials'}
 
     async def _step_generate_final(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤6: 生成最终报告（使用提示词模板）"""
+        """步骤6: 生成最终报告（逐字打印修复）"""
         state['current_step'] = 'generate_final'
 
         yield {
             'type': 'section_start',
             'step': 'generate_final',
-            'title': '生成最终报告',
+            'title': '📝 生成最终报告',
             'collapsible': False
         }
 
         yield {
             'type': 'log',
             'step': 'generate_final',
-            'content': '📝 正在生成综合报告...\n'
+            'source': 'generate_final',
+            'content': '正在生成综合报告...\n',
+            'newline': True
         }
 
-        # 汇总文献分析
         papers_summary = []
         for i, item in enumerate(state['paper_analyses']):
             summary = f"**文献 {i+1}**: {item['paper']['title']} - {item['analysis'][:200]}..."
             papers_summary.append(summary)
 
-        # 使用提示词模板
         prompt = self.prompts.generate_final_report(
             state['user_query'],
             state['patient_features'],
-            chr(10).join(papers_summary) if papers_summary else "暂无",
+            '\n'.join(papers_summary) if papers_summary else "暂无",
             state['trial_analysis']
         )
 
         messages = [{"role": "user", "content": prompt}]
 
+        # 关键修复：创建一个初始的空 result
+        yield {
+            'type': 'result',
+            'step': 'generate_final',
+            'content': '',  # 初始为空
+            'summary': ''
+        }
+
         final_answer = ""
         try:
+            # 逐字流式输出
             async for token in llm_service.chat_stream(messages=messages):
                 final_answer += token
+                # 每次追加 token
+                yield {
+                    'type': 'token',
+                    'step': 'generate_final',
+                    'content': token
+                }
 
             state['final_answer'] = final_answer
 
+            # 最终汇总
             yield {
                 'type': 'result',
                 'step': 'generate_final',
-                'content': final_answer,
+                'content': '',  # 已经通过 token 流式输出
                 'summary': '✅ 最终报告生成完成'
             }
 
@@ -523,7 +543,9 @@ class WorkflowService:
             yield {
                 'type': 'log',
                 'step': 'generate_final',
-                'content': f'❌ 生成失败: {str(e)}\n'
+                'source': 'generate_final',
+                'content': f'❌ 生成失败: {str(e)}\n',
+                'newline': True
             }
 
         yield {'type': 'section_end', 'step': 'generate_final'}
@@ -635,5 +657,4 @@ class WorkflowService:
             await db.commit()
 
 
-# 全局实例
 workflow_service = WorkflowService()

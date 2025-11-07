@@ -187,10 +187,9 @@
             <div class="message-content">
               <div class="message-bubble assistant-bubble">
                 <!-- 渲染工作流区块 -->
-                <div v-for="(section, idx) in workflowSections" :key="idx" class="workflow-section">
-                  <div v-for="(section, idx) in workflowSections" :key="idx" class="workflow-section">
+                <div v-for="(section, idx) in workflowSections" :key="`section-${idx}`" class="workflow-section">
                   <!-- 区块标题 -->
-                  <div class="section-header" @click="section.collapsed = !section.collapsed">
+                  <div class="section-header" @click="toggleSection(idx)">
                     <el-icon :class="['collapse-icon', { collapsed: section.collapsed }]">
                       <ArrowRight />
                     </el-icon>
@@ -200,26 +199,25 @@
                   
                   <!-- 区块内容 -->
                   <div v-show="!section.collapsed" class="section-content">
-                    <!-- 日志 - 使用 span 标签，inline 显示 -->
+                    <!-- 日志 -->
                     <div v-if="section.logs.length > 0" class="logs-container">
                       <span
                         v-for="(log, logIdx) in section.logs"
-                        :key="logIdx"
+                        :key="`log-${idx}-${logIdx}`"
                         :class="['log-item', `log-source-${log.source || 'default'}`]"
                         v-html="log.content"
                       ></span>
                     </div>
                     
-                    <!-- 结果 - Markdown渲染 -->
+                    <!-- 结果 -->
                     <div v-if="section.results.length > 0" class="results-container">
                       <div
                         v-for="(result, resultIdx) in section.results"
-                        :key="resultIdx"
+                        :key="`result-${idx}-${resultIdx}`"
                         class="result-item assistant-text"
                         v-html="renderMarkdown(result.content)"
                       ></div>
                     </div>
-                  </div>
                   </div>
                 </div>
                 
@@ -288,15 +286,27 @@
                 </div>
                 
                 <div class="toolbar-right">
+                  <!-- 停止按钮 -->
+                  <el-button
+                    v-if="isSending"
+                    type="danger"
+                    text
+                    @click="handleStop"
+                    class="stop-btn"
+                    title="停止生成"
+                  >
+                    <el-icon><CircleClose /></el-icon>
+                  </el-button>
+                  
                   <!-- 发送按钮 -->
                   <el-button
+                    v-else
                     type="primary"
                     :disabled="!inputValue.trim() || !chatStore.currentConversationId"
-                    :loading="isSending"
                     @click="handleSend"
                     class="send-btn"
                   >
-                    <el-icon v-if="!isSending"><Promotion /></el-icon>
+                    <el-icon><Promotion /></el-icon>
                   </el-button>
                 </div>
               </div>
@@ -324,7 +334,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, nextTick, onMounted, watch } from 'vue'
+import { ref, nextTick, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
@@ -343,7 +353,8 @@ import {
   Fold,
   MoreFilled,
   SwitchButton,
-  ArrowUp
+  ArrowUp,
+  CircleClose
 } from '@element-plus/icons-vue'
 import { useUserStore } from '@/stores/user'
 import { useChatStore } from '@/stores/chat'
@@ -368,7 +379,8 @@ const isSending = ref(false)
 const isAITyping = ref(false)
 const enableMultiSource = ref(false)
 const workflowDone = ref(false)
-const workflowSections = reactive([])  // 改用 reactive
+const workflowSections = ref([])  // 改用 ref
+const currentReader = ref(null)  // 用于存储当前的 Reader，以便停止
 
 // 监听对话切换，清空附件
 watch(() => chatStore.currentConversationId, () => {
@@ -501,6 +513,32 @@ const handleUserAction = async (command) => {
   }
 }
 
+// 切换区块展开/折叠
+const toggleSection = (idx) => {
+  const section = workflowSections.value[idx]
+  if (section.collapsible !== false) {
+    section.collapsed = !section.collapsed
+  }
+}
+
+// 停止生成
+const handleStop = async () => {
+  try {
+    if (currentReader.value) {
+      await currentReader.value.cancel()
+      currentReader.value = null
+    }
+    
+    isSending.value = false
+    isAITyping.value = false
+    workflowDone.value = true
+    
+    ElMessage.info('已停止生成')
+  } catch (error) {
+    console.error('停止失败:', error)
+  }
+}
+
 // 发送消息
 const handleSend = async () => {
   if (!inputValue.value.trim()) return
@@ -529,11 +567,12 @@ const handleSend = async () => {
   isSending.value = true
   isAITyping.value = true
   workflowDone.value = false
-  workflowSections.length = 0  // 清空数组（reactive方式）
+  workflowSections.value = []  // 清空数组
   
   try {
-    // 发送用户消息
-    await chatStore.sendUserMessage(content, conversationAttachments.value)
+    // 注意：无需手动调用 sendUserMessage
+    // chat/stream 接口会自动保存用户消息和AI回复
+    
     scrollToBottom()
     
     // 调用流式 API
@@ -559,6 +598,7 @@ const handleSend = async () => {
     }
 
     const reader = response.body.getReader()
+    currentReader.value = reader  // 保存 reader 引用
     const decoder = new TextDecoder()
     
     let currentSection = null
@@ -585,7 +625,7 @@ const handleSend = async () => {
                 results: [],
                 summary: ''
               }
-              workflowSections.push(currentSection)
+              workflowSections.value.push(currentSection)
               
             } else if (data.type === 'section_end') {
               if (currentSection && currentSection.collapsible) {
@@ -595,25 +635,17 @@ const handleSend = async () => {
               
             } else if (data.type === 'log') {
               if (currentSection) {
-                // 如果是追加到上一条日志（newline=false）
                 if (data.newline === false && currentSection.logs.length > 0) {
-                  const lastLogIndex = currentSection.logs.length - 1
-                  // 关键：创建新对象，触发Vue响应式更新
-                  currentSection.logs[lastLogIndex] = {
-                    ...currentSection.logs[lastLogIndex],
-                    content: currentSection.logs[lastLogIndex].content + data.content
-                  }
+                  // 追加到最后一条日志
+                  const lastIdx = currentSection.logs.length - 1
+                  currentSection.logs[lastIdx].content += data.content
                 } else {
-                  // 新建一条日志
+                  // 新建日志
                   currentSection.logs.push({
                     content: data.content,
                     source: data.source
                   })
                 }
-                // 强制更新（确保实时渲染）
-                nextTick(() => {
-                  scrollToBottom()
-                })
               }
               
             } else if (data.type === 'result') {
@@ -631,7 +663,7 @@ const handleSend = async () => {
               
             } else if (data.type === 'token') {
               // 普通聊天模式：逐字追加
-              if (workflowSections.length === 0) {
+              if (workflowSections.value.length === 0 || !currentSection) {
                 if (!currentSection) {
                   currentSection = {
                     step: 'chat',
@@ -642,30 +674,40 @@ const handleSend = async () => {
                     results: [{ content: '', data: null }],
                     summary: ''
                   }
-                  workflowSections.push(currentSection)
+                  workflowSections.value.push(currentSection)
                 }
-                // 逐字追加
-                const resultIndex = currentSection.results.length - 1
-                currentSection.results[resultIndex] = {
-                  ...currentSection.results[resultIndex],
-                  content: currentSection.results[resultIndex].content + data.content
-                }
-                // 强制更新
-                nextTick(() => {
-                  scrollToBottom()
-                })
+              }
+              
+              // 追加到当前 section 的第一个 result
+              if (currentSection && currentSection.results.length > 0) {
+                currentSection.results[0].content += data.content
               }
               
             } else if (data.type === 'done') {
               workflowDone.value = true
               isAITyping.value = false
+              currentReader.value = null
               await chatStore.fetchMessages(chatStore.currentConversationId)
-              scrollToBottom()
+              
+            } else if (data.type === 'title_updated') {
+              // 处理标题更新事件
+              const conversationId = data.conversation_id
+              const newTitle = data.title
+              
+              // 更新本地 store 中的对话标题
+              const conv = chatStore.conversations.find(c => c.id === conversationId)
+              if (conv) {
+                conv.title = newTitle
+              }
+              
+              // 显示提示
+              ElMessage.success(`对话已自动重命名为「${newTitle}」`)
               
             } else if (data.type === 'error') {
               ElMessage.error(data.content)
               isAITyping.value = false
               workflowDone.value = true
+              currentReader.value = null
             }
             
             scrollToBottom()
@@ -677,12 +719,15 @@ const handleSend = async () => {
       }
     }
     
+    currentReader.value = null
+    
   } catch (error) {
     console.error('发送消息失败:', error)
     ElMessage.error('发送失败，请重试')
     inputValue.value = content
     isAITyping.value = false
     workflowDone.value = true
+    currentReader.value = null
   } finally {
     isSending.value = false
   }
@@ -1133,13 +1178,11 @@ const formatTime = (timestamp) => {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 
-/* 用户消息文本：保留换行，使用 pre-wrap */
 .user-text {
   white-space: pre-wrap;
   word-break: break-word;
 }
 
-/* AI消息文本：Markdown渲染，使用 normal */
 .assistant-text {
   white-space: normal;
   word-break: break-word;
@@ -1153,7 +1196,7 @@ const formatTime = (timestamp) => {
 }
 
 /* ============================================
-   Markdown 内容样式（仅AI消息）
+   Markdown 内容样式
    ============================================ */
 .assistant-text :deep(h1),
 .assistant-text :deep(h2),
@@ -1163,22 +1206,6 @@ const formatTime = (timestamp) => {
   margin-bottom: 6px;
   font-weight: 600;
   line-height: 1.3;
-}
-
-.assistant-text :deep(h1) {
-  font-size: 1.5em;
-}
-
-.assistant-text :deep(h2) {
-  font-size: 1.3em;
-}
-
-.assistant-text :deep(h3) {
-  font-size: 1.15em;
-}
-
-.assistant-text :deep(h4) {
-  font-size: 1em;
 }
 
 .assistant-text :deep(p) {
@@ -1192,16 +1219,11 @@ const formatTime = (timestamp) => {
   padding-left: 20px;
 }
 
-.assistant-text :deep(li) {
-  margin: 3px 0;
-  line-height: 1.5;
-}
-
 .assistant-text :deep(code) {
   background: #f5f5f5;
   padding: 2px 5px;
   border-radius: 3px;
-  font-family: 'Courier New', 'Consolas', monospace;
+  font-family: 'Courier New', monospace;
   font-size: 0.9em;
   color: #e6426a;
 }
@@ -1211,16 +1233,7 @@ const formatTime = (timestamp) => {
   padding: 10px;
   border-radius: 4px;
   overflow-x: auto;
-  font-size: 0.85em;
-  line-height: 1.4;
   margin: 8px 0;
-}
-
-.assistant-text :deep(pre code) {
-  background: none;
-  padding: 0;
-  color: inherit;
-  font-size: 1em;
 }
 
 .assistant-text :deep(table) {
@@ -1228,7 +1241,6 @@ const formatTime = (timestamp) => {
   border-collapse: collapse;
   margin: 10px 0;
   font-size: 0.9em;
-  background: white;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
 }
 
@@ -1239,44 +1251,12 @@ const formatTime = (timestamp) => {
   padding: 6px 8px;
   text-align: left;
   border: 1px solid #e4e7ed;
-  font-size: 0.95em;
 }
 
 .assistant-text :deep(table td) {
   padding: 6px 8px;
   border: 1px solid #e4e7ed;
   color: #303133;
-  line-height: 1.4;
-}
-
-.assistant-text :deep(table tr:hover) {
-  background: #fafbfc;
-}
-
-.assistant-text :deep(blockquote) {
-  border-left: 3px solid #409eff;
-  padding: 6px 12px;
-  margin: 8px 0;
-  background: #f4f8fb;
-  color: #606266;
-  font-style: italic;
-}
-
-.assistant-text :deep(a) {
-  color: #409eff;
-  text-decoration: none;
-}
-
-.assistant-text :deep(a:hover) {
-  text-decoration: underline;
-}
-
-.assistant-text :deep(strong) {
-  font-weight: 600;
-}
-
-.assistant-text :deep(em) {
-  font-style: italic;
 }
 
 /* ============================================
@@ -1335,13 +1315,12 @@ const formatTime = (timestamp) => {
   padding: 10px 12px;
 }
 
-/* 日志容器：紧凑、inline 显示 */
 .logs-container {
   margin-bottom: 8px;
   padding: 8px 10px;
   background: #f9fafb;
   border-radius: 4px;
-  font-family: 'Courier New', 'Consolas', monospace;
+  font-family: 'Courier New', monospace;
   font-size: 12px;
   max-height: 250px;
   overflow-y: auto;
@@ -1367,7 +1346,6 @@ const formatTime = (timestamp) => {
   color: #e6a23c;
 }
 
-/* 结果容器：Markdown渲染 */
 .results-container {
   line-height: 1.5;
 }
@@ -1376,112 +1354,6 @@ const formatTime = (timestamp) => {
   margin-bottom: 8px;
 }
 
-.result-item :deep(h1),
-.result-item :deep(h2),
-.result-item :deep(h3),
-.result-item :deep(h4) {
-  margin-top: 10px;
-  margin-bottom: 6px;
-  font-weight: 600;
-  line-height: 1.3;
-}
-
-.result-item :deep(h1) {
-  font-size: 1.5em;
-}
-
-.result-item :deep(h2) {
-  font-size: 1.3em;
-}
-
-.result-item :deep(h3) {
-  font-size: 1.15em;
-}
-
-.result-item :deep(h4) {
-  font-size: 1em;
-}
-
-.result-item :deep(p) {
-  margin: 5px 0;
-  line-height: 1.6;
-}
-
-.result-item :deep(ul),
-.result-item :deep(ol) {
-  margin: 6px 0;
-  padding-left: 20px;
-}
-
-.result-item :deep(li) {
-  margin: 3px 0;
-  line-height: 1.5;
-}
-
-.result-item :deep(table) {
-  width: 100%;
-  border-collapse: collapse;
-  margin: 10px 0;
-  font-size: 0.9em;
-  background: white;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
-}
-
-.result-item :deep(table th) {
-  background: #f5f7fa;
-  color: #606266;
-  font-weight: 600;
-  padding: 6px 8px;
-  text-align: left;
-  border: 1px solid #e4e7ed;
-}
-
-.result-item :deep(table td) {
-  padding: 6px 8px;
-  border: 1px solid #e4e7ed;
-  color: #303133;
-  line-height: 1.4;
-}
-
-.result-item :deep(table tr:hover) {
-  background: #fafbfc;
-}
-
-.result-item :deep(code) {
-  background: #f5f5f5;
-  padding: 2px 5px;
-  border-radius: 3px;
-  font-family: 'Courier New', 'Consolas', monospace;
-  font-size: 0.9em;
-  color: #e6426a;
-}
-
-.result-item :deep(pre) {
-  background: #f5f5f5;
-  padding: 10px;
-  border-radius: 4px;
-  overflow-x: auto;
-  font-size: 0.85em;
-  line-height: 1.4;
-  margin: 8px 0;
-}
-
-.result-item :deep(pre code) {
-  background: none;
-  padding: 0;
-  color: inherit;
-}
-
-.result-item :deep(blockquote) {
-  border-left: 3px solid #409eff;
-  padding: 6px 12px;
-  margin: 8px 0;
-  background: #f4f8fb;
-  color: #606266;
-  font-style: italic;
-}
-
-/* 正在输入指示器 */
 .typing-indicator {
   display: inline-flex;
   gap: 4px;
@@ -1610,7 +1482,8 @@ const formatTime = (timestamp) => {
   gap: 4px;
 }
 
-.send-btn {
+.send-btn,
+.stop-btn {
   border-radius: 8px;
 }
 
@@ -1619,18 +1492,5 @@ const formatTime = (timestamp) => {
   text-align: center;
   font-size: 12px;
   color: #909399;
-}
-
-/* ============================================
-   下拉菜单样式
-   ============================================ */
-:deep(.el-dropdown-menu__item) {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-:deep(.el-loading-mask) {
-  background-color: rgba(255, 255, 255, 0.7);
 }
 </style>
