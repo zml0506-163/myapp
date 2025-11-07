@@ -570,15 +570,15 @@ const handleSend = async () => {
   workflowSections.value = []  // 清空数组
   
   try {
-    // 注意：无需手动调用 sendUserMessage
-    // chat/stream 接口会自动保存用户消息和AI回复
-    
+    // 刷新发送消息页面样式，不调用后端
+    await chatStore.sendUserMessage(content, conversationAttachments.value)
     scrollToBottom()
     
     // 调用流式 API
     const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
     const token = localStorage.getItem('chat_token')
     
+    // chat/stream 接口会自动保存用户消息和AI回复
     const response = await fetch(`${baseURL}/chat/stream`, {
       method: 'POST',
       headers: {
@@ -709,7 +709,7 @@ const handleSend = async () => {
               workflowDone.value = true
               currentReader.value = null
             }
-            
+            await nextTick();
             scrollToBottom()
             
           } catch (e) {

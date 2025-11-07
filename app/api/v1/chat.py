@@ -309,7 +309,7 @@ async def chat_stream(
 
                 async for chunk in llm_service.chat_stream(messages=messages):
                     ai_content += chunk
-                    yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'type': 'result', 'content': chunk}, ensure_ascii=False)}\n\n"
 
                 # 保存 AI 消息
                 async with get_db_session() as db:

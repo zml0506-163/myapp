@@ -67,8 +67,43 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  // 注意：sendUserMessage 已废弃
+  // 发送消息
+  // 注意：sendUserMessage 只修改前端,不调用后端保存
   // 前端直接调用 /chat/stream 接口，该接口会自动保存用户消息和AI回复
+  const sendUserMessage = async (content, attachments = []) => {
+    if (!currentConversationId.value) {
+      ElMessage.warning('请先选择或创建对话')
+      return
+    }
+
+    try {
+      const message = {
+        content,
+        message_type: 'user',
+        conversation_id: currentConversationId.value,
+        attachments
+      }
+      
+      messages.value.push(message)
+      
+      // 更新对话列表中的时间戳
+      const conv = conversations.value.find(c => c.id === currentConversationId.value)
+      if (conv) {
+        conv.updated_at = new Date().toISOString()
+        // 将对话移到列表顶部
+        conversations.value = [
+          conv,
+          ...conversations.value.filter(c => c.id !== currentConversationId.value)
+        ]
+      }
+      
+      return message
+    } catch (error) {
+      console.error('Send message failed:', error)
+      ElMessage.error('发送消息失败')
+      throw error
+    }
+  }
 
   // 重命名对话
   const renameConversation = async (conversationId, title) => {
@@ -119,6 +154,7 @@ export const useChatStore = defineStore('chat', () => {
     createNewConversation,
     switchConversation,
     fetchMessages,
+    sendUserMessage,
     renameConversation,
     removeConversation
   }
