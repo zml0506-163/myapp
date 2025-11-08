@@ -1,5 +1,6 @@
 """
 工作流服务
+app/services/workflow_service.py
 """
 import os
 import json
@@ -10,7 +11,7 @@ from sqlalchemy import select, func
 from app.core.config import settings
 from app.db.database import get_db_session
 from app.services.llm_service import llm_service
-from app.services.search_service import optimized_search_service
+from app.services.search_service import search_service
 from app.prompts.workflow_prompts import WorkflowPrompts
 from app.models import WorkflowExecution, Message, MessageType
 from app.crud import message as crud_message
@@ -50,12 +51,10 @@ class WorkflowService:
             user_attachments: List[Dict] = None,
             is_first_conversation: bool = False
     ) -> AsyncGenerator[Dict, None]:
-        """执行工作流并流式输出（添加标题生成）"""
+        """执行工作流并流式输出"""
 
-        # 创建执行记录
         execution_id = await self._create_execution(conversation_id, user_id)
 
-        # 初始化状态
         state: WorkflowState = {
             'conversation_id': conversation_id,
             'user_id': user_id,
@@ -78,85 +77,45 @@ class WorkflowService:
             # 执行所有步骤
             async for chunk in self._step_extract_features(state):
                 yield chunk
+                # 添加延迟确保前端接收
+                await asyncio.sleep(0.01)
 
             async for chunk in self._step_generate_queries(state):
                 yield chunk
+                await asyncio.sleep(0.01)
 
             async for chunk in self._step_search(state):
                 yield chunk
+                await asyncio.sleep(0.01)
 
             async for chunk in self._step_analyze_papers(state):
                 yield chunk
+                await asyncio.sleep(0.01)
 
             async for chunk in self._step_analyze_trials(state):
                 yield chunk
+                await asyncio.sleep(0.01)
 
             async for chunk in self._step_generate_final(state):
                 yield chunk
+                await asyncio.sleep(0.01)
 
             # 保存结果
             await self._save_result(state, execution_id)
-
-            # 更新执行状态
             await self._update_execution(execution_id, 'completed')
 
-            # === 新增：生成对话标题 ===
+            # 生成标题
             if is_first_conversation:
-                try:
-                    # 使用患者特征和查询生成标题
-                    title_prompt = f"""请根据以下医疗咨询内容生成一个简短的标题（不超过15个字）：
-        
-用户问题：{user_query}
+                await self._generate_title(state, conversation_id, user_id)
 
-患者特征：{state['patient_features'][:300]}...
-
-要求：
-1. 突出疾病/症状关键词
-2. 不超过15个字
-3. 直接输出标题，不要有其他内容
-4. 不使用引号、书名号等标点符号
-
-标题："""
-
-                    new_title = ""
-                    messages = [{"role": "user", "content": title_prompt}]
-
-                    async for token in llm_service.chat_stream(
-                            messages=messages,
-                            system_prompt="你是一个专业的标题生成助手。"
-                    ):
-                        new_title += token
-
-                    # 清理标题
-                    new_title = new_title.strip().replace('\n', '').replace('"', '').replace("'", '')
-
-                    if new_title and len(new_title) > 2:
-                        if len(new_title) > 15:
-                            new_title = new_title[:15] + "..."
-
-                        async with get_db_session() as db:
-                            from app.schemas.conversation import ConversationUpdateSchema
-                            from app.crud import conversation as crud_conversation
-                            await crud_conversation.update_conversation(
-                                db,
-                                conversation_id=conversation_id,
-                                conversation_schema=ConversationUpdateSchema(title=new_title),
-                                user_id=user_id
-                            )
-
-                        # 通知前端标题已更新
-                        yield {
-                            'type': 'title_updated',
-                            'conversation_id': conversation_id,
-                            'title': new_title
-                        }
-                        print(f"✅ 多源检索对话已自动重命名为「{new_title}」")
-
-                except Exception as e:
-                    print(f"生成标题失败: {e}")
+            # 最终完成信号
             yield {'type': 'done', 'content': ''}
 
         except Exception as e:
+            import traceback
+            error_detail = traceback.format_exc()
+            print(f"❌ 工作流执行失败: {error_detail}")
+
             await self._update_execution(execution_id, 'failed', str(e))
             yield {
                 'type': 'error',
@@ -165,14 +124,24 @@ class WorkflowService:
             }
 
     async def _step_extract_features(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤1: 提取患者特征（优化附件处理）"""
+        """步骤1: 提取患者特征（修复日志输出）"""
         state['current_step'] = 'extract_features'
 
+        # 开始区块
         yield {
             'type': 'section_start',
             'step': 'extract_features',
             'title': '🔍 提取患者特征',
             'collapsible': True
+        }
+
+        # 立即输出日志
+        yield {
+            'type': 'log',
+            'step': 'extract_features',
+            'source': 'extract_features',
+            'content': '正在分析患者信息...\n',
+            'newline': True
         }
 
         # 构建上下文
@@ -189,30 +158,21 @@ class WorkflowService:
                 context_parts.append(f"- {att['original_filename']}")
 
         context = "\n".join(context_parts)
-
         prompt = self.prompts.extract_features(context, state['user_query'])
 
         full_response = ""
 
-        yield {
-            'type': 'log',
-            'step': 'extract_features',
-            'source': 'extract_features',
-            'content': '正在分析患者信息...\n',
-            'newline': True
-        }
-
         try:
             # 处理附件
+            file_ids = []
             if state['user_attachments']:
                 from app.services.file_service import file_service
-
                 file_ids, only_images = await file_service.process_attachments(
                     state['user_attachments']
                 )
 
+                # 如果只有一张图片，使用VL模型
                 if only_images and len(file_ids) == 1:
-                    # 只有一张图片：使用VL模型
                     image_att = state['user_attachments'][0]
                     async for token in llm_service.chat_with_image_stream(
                             text=prompt,
@@ -221,21 +181,25 @@ class WorkflowService:
                     ):
                         full_response += token
                 else:
-                    # 有多个文件或包含非图片文件：使用qwen-long
-                    async for token in llm_service.chat_with_files_stream(
-                            text=prompt,
+                    # 使用统一接口
+                    async for token in llm_service.chat_with_context(
+                            user_query=prompt,
                             file_ids=file_ids,
-                            history=[]
+                            system_prompt="你是一个专业的医疗信息分析助手。",
+                            model=settings.qwen_long_model
                     ):
                         full_response += token
             else:
                 # 无附件：普通对话
-                messages = [{"role": "user", "content": prompt}]
-                async for token in llm_service.chat_stream(messages=messages):
+                async for token in llm_service.chat_with_context(
+                        user_query=prompt,
+                        system_prompt="你是一个专业的医疗信息分析助手。"
+                ):
                     full_response += token
 
             state['patient_features'] = full_response
 
+            # 输出结果
             yield {
                 'type': 'result',
                 'step': 'extract_features',
@@ -244,15 +208,17 @@ class WorkflowService:
             }
 
         except Exception as e:
+            error_msg = f'❌ 分析失败: {str(e)}\n'
             yield {
                 'type': 'log',
                 'step': 'extract_features',
                 'source': 'extract_features',
-                'content': f'❌ 分析失败: {str(e)}\n',
+                'content': error_msg,
                 'newline': True
             }
             state['errors'].append(f'extract_features: {str(e)}')
 
+        # 结束区块
         yield {'type': 'section_end', 'step': 'extract_features'}
 
     async def _step_generate_queries(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
@@ -266,9 +232,6 @@ class WorkflowService:
             'collapsible': True
         }
 
-        prompt = self.prompts.generate_queries(state['patient_features'])
-        messages = [{"role": "user", "content": prompt}]
-
         yield {
             'type': 'log',
             'step': 'generate_queries',
@@ -277,11 +240,17 @@ class WorkflowService:
             'newline': True
         }
 
+        prompt = self.prompts.generate_queries(state['patient_features'])
         full_response = ""
+
         try:
-            async for token in llm_service.chat_stream(messages=messages):
+            async for token in llm_service.chat_with_context(
+                    user_query=prompt,
+                    system_prompt="你是一个专业的检索条件生成助手。"
+            ):
                 full_response += token
 
+            # 解析JSON
             start = full_response.find('{')
             end = full_response.rfind('}') + 1
             if start != -1 and end > start:
@@ -318,7 +287,7 @@ class WorkflowService:
         yield {'type': 'section_end', 'step': 'generate_queries'}
 
     async def _step_search(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤3: 执行检索"""
+        """步骤3: 执行检索（修复进度显示）"""
         state['current_step'] = 'search'
 
         yield {
@@ -332,24 +301,36 @@ class WorkflowService:
         target_count = settings.max_search_results
 
         async def search_all():
-            papers = await optimized_search_service.search_papers_with_ranking(
-                state['pubmed_query'],
-                target_count,
-                progress_queue
-            )
-            state['papers'].extend(papers)
+            """执行检索任务"""
+            try:
+                papers = await search_service.search_papers_with_ranking(
+                    state['pubmed_query'],
+                    target_count,
+                    progress_queue
+                )
+                state['papers'].extend(papers)
 
-            trials = await optimized_search_service.search_trials_with_ranking(
-                state['clinical_trial_keywords'],
-                target_count,
-                progress_queue
-            )
-            state['trials'].extend(trials)
+                trials = await search_service.search_trials_with_ranking(
+                    state['clinical_trial_keywords'],
+                    target_count,
+                    progress_queue
+                )
+                state['trials'].extend(trials)
 
-            await progress_queue.put({'type': 'DONE'})
+            except Exception as e:
+                await progress_queue.put({
+                    'type': 'log',
+                    'source': 'search',
+                    'content': f'❌ 检索出错: {str(e)}\n',
+                    'newline': True
+                })
+            finally:
+                await progress_queue.put({'type': 'DONE'})
 
+        # 启动检索任务
         search_task = asyncio.create_task(search_all())
 
+        # 转发进度消息
         while True:
             msg = await progress_queue.get()
 
@@ -357,10 +338,12 @@ class WorkflowService:
                 if msg.get('type') == 'DONE':
                     break
                 elif msg.get('type') in ('log', 'result'):
+                    # 直接转发
                     yield msg
 
         await search_task
 
+        # 汇总结果
         yield {
             'type': 'result',
             'step': 'search',
@@ -378,7 +361,7 @@ class WorkflowService:
         yield {'type': 'section_end', 'step': 'search'}
 
     async def _step_analyze_papers(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤4: 分析文献（修复qwen-long调用）"""
+        """步骤4: 分析文献（使用统一接口）"""
         state['current_step'] = 'analyze_papers'
 
         yield {
@@ -405,7 +388,7 @@ class WorkflowService:
                 'type': 'log',
                 'step': 'analyze_papers',
                 'source': 'analyze_papers',
-                'content': f'\n📄 分析文献 {i+1}/{len(state["papers"])}: {paper["title"]}\n',
+                'content': f'\n📄 分析文献 {i+1}/{len(state["papers"])}: {paper["title"][:50]}...\n',
                 'newline': True
             }
 
@@ -428,16 +411,18 @@ class WorkflowService:
 
             analysis = ""
             try:
-                # 使用qwen-long + file_id方式
+                # 获取文件ID
                 file_id = await file_service.get_or_upload_file(pdf_path)
 
                 if not file_id:
                     raise Exception("文件上传失败")
 
-                async for token in llm_service.chat_with_files_stream(
-                        text=prompt,
+                # 使用统一接口分析
+                async for token in llm_service.chat_with_context(
+                        user_query=prompt,
                         file_ids=[file_id],
-                        history=[]
+                        system_prompt="你是一个专业的医疗文献分析助手。请仔细阅读PDF文档并基于内容回答。",
+                        model=settings.qwen_long_model
                 ):
                     analysis += token
 
@@ -450,8 +435,8 @@ class WorkflowService:
                     'type': 'result',
                     'step': 'analyze_papers',
                     'content': f"""### 文献 {i+1}: {paper['title']}
-    
-    {analysis}""",
+
+{analysis}""",
                     'data': {
                         'paper_id': paper.get('id'),
                         'pmid': paper.get('pmid'),
@@ -522,12 +507,11 @@ class WorkflowService:
             '\n'.join(trials_text)
         )
 
-        messages = [{"role": "user", "content": prompt}]
-
         analysis = ""
         try:
-            async for token in llm_service.chat_stream(
-                    messages=messages,
+            async for token in llm_service.chat_with_context(
+                    user_query=prompt,
+                    system_prompt="你是一个专业的临床试验分析助手。",
                     model=settings.qwen_long_model
             ):
                 analysis += token
@@ -553,7 +537,7 @@ class WorkflowService:
         yield {'type': 'section_end', 'step': 'analyze_trials'}
 
     async def _step_generate_final(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤6: 生成最终报告（逐字打印修复）"""
+        """步骤6: 生成最终报告"""
         state['current_step'] = 'generate_final'
 
         yield {
@@ -583,22 +567,14 @@ class WorkflowService:
             state['trial_analysis']
         )
 
-        messages = [{"role": "user", "content": prompt}]
-
-        # 关键修复：创建一个初始的空 result
-        yield {
-            'type': 'result',
-            'step': 'generate_final',
-            'content': '',  # 初始为空
-            'summary': ''
-        }
-
         final_answer = ""
         try:
-            # 逐字流式输出
-            async for token in llm_service.chat_stream(messages=messages):
+            async for token in llm_service.chat_with_context(
+                    user_query=prompt,
+                    system_prompt="你是一个专业的医疗咨询报告生成助手。"
+            ):
                 final_answer += token
-                # 每次追加 token
+                # 流式输出
                 yield {
                     'type': 'token',
                     'step': 'generate_final',
@@ -607,11 +583,10 @@ class WorkflowService:
 
             state['final_answer'] = final_answer
 
-            # 最终汇总
             yield {
                 'type': 'result',
                 'step': 'generate_final',
-                'content': '',  # 已经通过 token 流式输出
+                'content': '',
                 'summary': '✅ 最终报告生成完成'
             }
 
@@ -625,6 +600,52 @@ class WorkflowService:
             }
 
         yield {'type': 'section_end', 'step': 'generate_final'}
+
+    async def _generate_title(self, state: WorkflowState, conversation_id: int, user_id: int):
+        """生成对话标题"""
+        try:
+            title_prompt = f"""请根据以下医疗咨询内容生成一个简短的标题（不超过15个字）：
+
+用户问题：{state['user_query']}
+
+患者特征：{state['patient_features'][:300]}...
+
+要求：
+1. 突出疾病/症状关键词
+2. 不超过15个字
+3. 直接输出标题，不要有其他内容
+4. 不使用引号、书名号等标点符号
+
+标题："""
+
+            new_title = ""
+            async for token in llm_service.chat_with_context(
+                    user_query=title_prompt,
+                    system_prompt="你是一个专业的标题生成助手。"
+            ):
+                new_title += token
+
+            # 清理标题
+            new_title = new_title.strip().replace('\n', '').replace('"', '').replace("'", '')
+
+            if new_title and len(new_title) > 2:
+                if len(new_title) > 15:
+                    new_title = new_title[:15] + "..."
+
+                async with get_db_session() as db:
+                    from app.schemas.conversation import ConversationUpdateSchema
+                    from app.crud import conversation as crud_conversation
+                    await crud_conversation.update_conversation(
+                        db,
+                        conversation_id=conversation_id,
+                        conversation_schema=ConversationUpdateSchema(title=new_title),
+                        user_id=user_id
+                    )
+
+                print(f"✅ 对话已自动重命名为「{new_title}」")
+
+        except Exception as e:
+            print(f"生成标题失败: {e}")
 
     async def _create_execution(self, conversation_id: int, user_id: int) -> int:
         """创建执行记录"""

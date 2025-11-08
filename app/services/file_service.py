@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 from PIL import Image
-from sqlalchemy import select
+from sqlalchemy import select, func
 from openai import OpenAI, NotFoundError
 
 from app.core.config import settings
@@ -26,10 +26,6 @@ class FileService:
         'ebook': {'.epub', '.mobi'}
     }
 
-    # 文件大小限制
-    MAX_IMAGE_SIZE = 20 * 1024 * 1024  # 20MB
-    MAX_DOCUMENT_SIZE = 150 * 1024 * 1024  # 150MB
-
     def __init__(self):
         self.client = OpenAI(
             api_key=settings.dashscope_api_key,
@@ -37,6 +33,8 @@ class FileService:
         )
         self.temp_dir = Path(settings.upload_dir) / "temp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.MAX_PIXELS = 8190  # 像素限制
+        self.MIN_COMPRESS_FILE_SIZE = 2 * 1024 * 1024  # 5MB
 
     def calculate_file_md5(self, file_path: str) -> str:
         """计算文件MD5值"""
@@ -101,6 +99,38 @@ class FileService:
             print(f"图片压缩失败: {e}")
             return input_path
 
+    def resize_image_by_pixels(self, input_path: str) -> str:
+        """调整图片尺寸，确保宽/高均不超过MAX_PIXELS"""
+        input_path = Path(input_path)
+        try:
+            with Image.open(input_path) as img:
+                width, height = img.size
+
+                # 检查是否超过像素限制
+                if width <= self.MAX_PIXELS and height <= self.MAX_PIXELS:
+                    return str(input_path)  # 无需调整
+
+                # 计算缩放比例（取最小比例，确保宽高均不超限）
+                scale = min(self.MAX_PIXELS / width, self.MAX_PIXELS / height)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+
+                # 高质量缩放（保留原图模式，避免不必要的格式转换）
+                resized_img = img.resize((new_width, new_height), Image.LANCZOS)
+
+                # 保存调整后的图片
+                output_path = self.temp_dir / f"resized_{input_path.name}"
+                # 根据原图格式保存（优先保留原图格式）
+                format = img.format or "JPEG"
+                resized_img.save(output_path, format=format, optimize=True)
+
+                print(f"图片尺寸调整: {width}x{height} -> {new_width}x{new_height}")
+                return str(output_path)
+
+        except Exception as e:
+            print(f"图片尺寸调整失败: {e}")
+            return str(input_path)  # 失败时返回原图
+
     async def verify_file_id(self, file_id: str) -> bool:
         """验证qwen-long的file_id是否有效"""
         try:
@@ -156,9 +186,13 @@ class FileService:
                 upload_path = file_path
 
                 if file_type == 'image':
-                    file_size = os.path.getsize(file_path)
-                    if file_size > 5 * 1024 * 1024:  # 大于5MB才压缩
-                        upload_path = self.compress_image(file_path)
+
+                    # 1. 先检查并调整像素（避免像素超限错误）
+                    resized_path = self.resize_image_by_pixels(file_path)
+                    file_size = os.path.getsize(resized_path)
+                    # 2. 再根据文件大小决定是否压缩（大于5MB则压缩）
+                    if file_size > self.MIN_COMPRESS_FILE_SIZE:  # 大于5MB才压缩
+                        upload_path = self.compress_image(resized_path)
 
                 # 上传到qwen-long
                 file_object = self.client.files.create(
@@ -166,7 +200,7 @@ class FileService:
                     purpose="file-extract"
                 )
 
-                print(f"文件上传成功: {Path(file_path).name} -> {file_object.id}")
+                print(f"文件上传成功: {Path(resized_path).name} -> {file_object.id}")
 
                 # 5. 保存到缓存
                 if cached:
@@ -181,9 +215,9 @@ class FileService:
                     # 创建新记录
                     new_cache = FileCache(
                         file_md5=file_md5,
-                        original_filename=Path(file_path).name,
-                        file_path=file_path,
-                        file_size=os.path.getsize(file_path),
+                        original_filename=Path(resized_path).name,
+                        file_path=resized_path,
+                        file_size=os.path.getsize(resized_path),
                         mime_type=None,
                         qwen_file_id=file_object.id,
                         qwen_status=file_object.status,

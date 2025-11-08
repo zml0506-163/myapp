@@ -1,11 +1,9 @@
 """
-优化的多源检索服务 V2
-- 检索更多，筛选最相关
-- 去重处理
-- PDF下载失败继续检索
+优化的多源检索服务
+app/services/search_service.py
 """
 import asyncio
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional
 from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy import select, or_, and_
 import difflib
@@ -15,7 +13,7 @@ from app.db.database import get_db_session
 from app.models import Paper, ClinicalTrial
 from app.db.crud import upsert_paper, upsert_clinical_trial
 
-from app.tools.pubmed_client import esearch_pmids, efetch_metadata, get_pdf_from_pubmed
+from app.tools.pubmed_client import pubmed_client
 from app.tools.europepmc_client import search_europe_pmc
 from app.tools.clinical_trials_client import async_search_trials
 
@@ -40,29 +38,25 @@ class SearchProgress:
         )
 
 
-class OptimizedSearchService:
+class SearchService:
     """优化的多源检索服务"""
 
     def __init__(self):
-        self.executor = ThreadPoolExecutor(max_workers=5)
+        self.executor = ThreadPoolExecutor(max_workers=settings.max_concurrent_downloads)
 
     def _calculate_relevance(self, query: str, text: str) -> float:
         """
         计算文本与查询的相关度（0-100分）
-
-        使用简单的关键词匹配算法
         """
         if not text:
             return 0.0
 
-        # 提取查询关键词
         query_terms = set(query.lower().replace('and', '').replace('or', '').split())
         query_terms = {term.strip() for term in query_terms if len(term.strip()) > 2}
 
         if not query_terms:
-            return 50.0  # 默认分数
+            return 50.0
 
-        # 计算匹配度
         text_lower = text.lower()
         matches = sum(1 for term in query_terms if term in text_lower)
         score = (matches / len(query_terms)) * 100
@@ -78,15 +72,12 @@ class OptimizedSearchService:
         unique_papers = []
 
         for paper in papers:
-            # 检查PMID
             if paper.get('pmid') and paper['pmid'] in seen_ids:
                 continue
 
-            # 检查PMCID
             if paper.get('pmcid') and paper['pmcid'] in seen_ids:
                 continue
 
-            # 检查标题相似度（> 0.9 认为重复）
             title = paper.get('title', '')
             is_duplicate = False
             for seen_title in seen_titles:
@@ -98,7 +89,6 @@ class OptimizedSearchService:
             if is_duplicate:
                 continue
 
-            # 添加唯一文献
             if paper.get('pmid'):
                 seen_ids.add(paper['pmid'])
             if paper.get('pmcid'):
@@ -115,49 +105,21 @@ class OptimizedSearchService:
             progress_queue: asyncio.Queue
     ) -> List[Dict]:
         """
-        检索并排序文献
+        检索并排序文献（优化版本）
 
-        Args:
-            query: 检索表达式
-            target_count: 目标文献数量
-            progress_queue: 进度队列
-
-        Returns:
-            排序后的文献列表
+        策略：
+        1. 先从数据库查缓存
+        2. 如果缓存不足，执行检索（检索更多）
+        3. 去重并按相关度排序
+        4. 返回前 N 篇
         """
-        # 1. 先查数据库缓存
-        cached_papers = []
-        async with get_db_session() as db:
-            search_terms = query.replace('AND', '').replace('OR', '').split()[:5]
-            if search_terms:
-                query_filter = select(Paper).where(
-                    and_(
-                        or_(
-                            Paper.source_type == 'pubmed',
-                            Paper.source_type == 'europepmc'
-                        ),
-                        or_(*[Paper.title.ilike(f"%{term}%") for term in search_terms if len(term) > 2])
-                    )
-                ).limit(target_count * 3)
+        # 1. 查询缓存
+        cached_papers = await self._search_cached_papers(query, target_count * settings.search_multiplier, progress_queue)
 
-                result = await db.execute(query_filter)
-                cached = result.scalars().all()
-
-                if cached:
-                    await progress_queue.put({
-                        'type': 'log',
-                        'source': 'cache',
-                        'content': f'📚 数据库中找到 {len(cached)} 篇已缓存文献\n',
-                        'newline': True
-                    })
-
-                    for paper in cached:
-                        cached_papers.append(self._paper_to_dict(paper))
-
-        # 2. 如果缓存不足，执行检索（检索更多）
         all_papers = cached_papers.copy()
 
-        if len(all_papers) < target_count * 3:
+        # 2. 如果缓存不足，执行检索
+        if len(all_papers) < target_count * settings.search_multiplier:
             await progress_queue.put({
                 'type': 'log',
                 'source': 'pubmed',
@@ -165,17 +127,24 @@ class OptimizedSearchService:
                 'newline': True
             })
 
-            # PubMed检索（检索3倍数量）
-            pubmed_papers = await self._fetch_pubmed_papers(
-                query, target_count * 3, progress_queue
+            # 并发检索 PubMed 和 Europe PMC
+            pubmed_task = asyncio.create_task(
+                self._fetch_pubmed_papers(query, target_count, progress_queue)
             )
-            all_papers.extend(pubmed_papers)
+            europepmc_task = asyncio.create_task(
+                self._fetch_europepmc_papers(query, target_count, progress_queue)
+            )
 
-            # Europe PMC检索（检索3倍数量）
-            europepmc_papers = await self._fetch_europepmc_papers(
-                query, target_count * 3, progress_queue
+            pubmed_papers, europepmc_papers = await asyncio.gather(
+                pubmed_task,
+                europepmc_task,
+                return_exceptions=True
             )
-            all_papers.extend(europepmc_papers)
+
+            if not isinstance(pubmed_papers, Exception):
+                all_papers.extend(pubmed_papers)
+            if not isinstance(europepmc_papers, Exception):
+                all_papers.extend(europepmc_papers)
 
         # 3. 去重
         all_papers = self._deduplicate_papers(all_papers)
@@ -195,7 +164,7 @@ class OptimizedSearchService:
 
         all_papers.sort(key=lambda p: p.get('relevance_score', 0), reverse=True)
 
-        # 5. 返回前N篇
+        # 5. 返回前 N 篇
         selected_papers = all_papers[:target_count]
 
         await progress_queue.put({
@@ -210,18 +179,66 @@ class OptimizedSearchService:
 
         return selected_papers
 
-    async def _fetch_pubmed_papers(
+    async def _search_cached_papers(
             self,
             query: str,
             limit: int,
             progress_queue: asyncio.Queue
     ) -> List[Dict]:
-        """检索PubMed（持续检索直到满足数量）"""
+        """从数据库查询缓存的文献"""
+        cached_papers = []
+
+        async with get_db_session() as db:
+            search_terms = query.replace('AND', '').replace('OR', '').split()[:5]
+            if search_terms:
+                query_filter = select(Paper).where(
+                    and_(
+                        or_(
+                            Paper.source_type == 'pubmed',
+                            Paper.source_type == 'europepmc'
+                        ),
+                        or_(*[Paper.title.ilike(f"%{term}%") for term in search_terms if len(term) > 2])
+                    )
+                ).limit(limit)
+
+                result = await db.execute(query_filter)
+                cached = result.scalars().all()
+
+                if cached:
+                    await progress_queue.put({
+                        'type': 'log',
+                        'source': 'cache',
+                        'content': f'📚 数据库中找到 {len(cached)} 篇已缓存文献\n',
+                        'newline': True
+                    })
+
+                    for paper in cached:
+                        cached_papers.append(self._paper_to_dict(paper))
+
+        return cached_papers
+
+    async def _fetch_pubmed_papers(
+            self,
+            query: str,
+            target_count: int,
+            progress_queue: asyncio.Queue
+    ) -> List[Dict]:
+        """
+        检索 PubMed（优化版本）
+
+        改进：
+        1. 使用配置的超时和并发控制
+        2. 达到目标数量后立即停止
+        3. 更详细的进度反馈
+        """
         results = []
 
         try:
-            # 搜索PMID
-            pmids = await esearch_pmids(query, retmax=limit * 5)
+            # 搜索 PMID（获取更多以应对下载失败）
+            pmids = await pubmed_client.esearch_pmids(
+                query,
+                retmax=settings.max_pmids_to_fetch
+            )
 
             if not pmids:
                 await progress_queue.put({
@@ -232,13 +249,29 @@ class OptimizedSearchService:
                 })
                 return results
 
-            # 获取元数据
-            meta = await efetch_metadata(pmids)
+            await progress_queue.put({
+                'type': 'log',
+                'source': 'pubmed',
+                'content': f'📥 找到 {len(pmids)} 个 PMID，准备下载 PDF...\n',
+                'newline': True
+            })
 
-            # 处理每个PMID，直到达到目标数量
+            # 获取元数据
+            meta = await pubmed_client.efetch_metadata(pmids)
+
+            # 并发下载 PDF（使用 Semaphore 控制并发）
             async with get_db_session() as db:
+                download_tasks = []
+
                 for pid in pmids:
-                    if len(results) >= limit:
+                    # 达到目标数量后停止
+                    if len(results) >= target_count:
+                        await progress_queue.put({
+                            'type': 'log',
+                            'source': 'pubmed',
+                            'content': f'✅ 已获取足够文献（{target_count} 篇），停止检索\n',
+                            'newline': True
+                        })
                         break
 
                     # 检查是否已存在
@@ -252,72 +285,40 @@ class OptimizedSearchService:
 
                     if existing:
                         results.append(self._paper_to_dict(existing))
-                        continue
-
-                    await progress_queue.put({
-                        'type': 'log',
-                        'source': 'pubmed',
-                        'content': f'  📄 处理 PMID {pid}...',
-                        'newline': False
-                    })
-
-                    m = meta.get(pid, {})
-                    progress = SearchProgress(progress_queue, 'pubmed')
-
-                    # 下载PDF（带重试机制）
-                    max_retries = 2
-                    pdf_path = None
-
-                    for retry in range(max_retries):
-                        pdf_path = await get_pdf_from_pubmed(
-                            pid,
-                            m.get("pmcid"),
-                            self.executor,
-                            progress.callback
-                        )
-
-                        if pdf_path:
-                            break
-
-                        if retry < max_retries - 1:
-                            await progress_queue.put({
-                                'type': 'log',
-                                'source': 'pubmed',
-                                'content': ' 重试...',
-                                'newline': False
-                            })
-
-                    if not pdf_path:
                         await progress_queue.put({
                             'type': 'log',
                             'source': 'pubmed',
-                            'content': ' ❌ 跳过\n',
+                            'content': f'  ✓ PMID {pid} 已存在缓存\n',
                             'newline': True
                         })
                         continue
 
-                    await progress_queue.put({
-                        'type': 'log',
-                        'source': 'pubmed',
-                        'content': ' ✅\n',
-                        'newline': True
-                    })
-
-                    # 保存到数据库
-                    paper = await upsert_paper(
-                        db,
-                        pmid=pid,
-                        pmcid=m.get("pmcid"),
-                        title=m.get("title") or "(no title)",
-                        source_type='pubmed',
-                        abstract=m.get("abstract"),
-                        pub_date=m.get("pub_date"),
-                        authors=m.get("authors"),
-                        pdf_path=str(pdf_path),
-                        source_url=f"https://pubmed.ncbi.nlm.nih.gov/{pid}/"
+                    # 创建下载任务
+                    task = self._download_and_save_paper(
+                        pid,
+                        meta.get(pid, {}),
+                        progress_queue
                     )
+                    download_tasks.append(task)
 
-                    results.append(self._paper_to_dict(paper))
+                # 等待所有下载任务完成
+                if download_tasks:
+                    papers = await asyncio.gather(*download_tasks, return_exceptions=True)
+
+                    for paper in papers:
+                        if paper and not isinstance(paper, Exception):
+                            results.append(paper)
+
+                            # 达到目标数量后停止
+                            if len(results) >= target_count:
+                                break
+
+            await progress_queue.put({
+                'type': 'log',
+                'source': 'pubmed',
+                'content': f'✅ PubMed 检索完成，成功获取 {len(results)} 篇文献\n',
+                'newline': True
+            })
 
         except Exception as e:
             await progress_queue.put({
@@ -329,17 +330,85 @@ class OptimizedSearchService:
 
         return results
 
+    async def _download_and_save_paper(
+            self,
+            pmid: str,
+            metadata: Dict,
+            progress_queue: asyncio.Queue
+    ) -> Optional[Dict]:
+        """下载并保存单篇文献"""
+        try:
+            await progress_queue.put({
+                'type': 'log',
+                'source': 'pubmed',
+                'content': f'  📄 处理 PMID {pmid}...',
+                'newline': False
+            })
+
+            # 创建进度回调
+            progress = SearchProgress(progress_queue, 'pubmed')
+
+            # 使用优化的客户端下载（带超时和并发控制）
+            pdf_path = await pubmed_client.download_pdf_with_limit(
+                pmid,
+                metadata.get("pmcid"),
+                self.executor,
+                progress.callback
+            )
+
+            if not pdf_path:
+                await progress_queue.put({
+                    'type': 'log',
+                    'source': 'pubmed',
+                    'content': ' ❌ 跳过\n',
+                    'newline': True
+                })
+                return None
+
+            await progress_queue.put({
+                'type': 'log',
+                'source': 'pubmed',
+                'content': ' ✅\n',
+                'newline': True
+            })
+
+            # 保存到数据库
+            async with get_db_session() as db:
+                paper = await upsert_paper(
+                    db,
+                    pmid=pmid,
+                    pmcid=metadata.get("pmcid"),
+                    title=metadata.get("title") or "(no title)",
+                    source_type='pubmed',
+                    abstract=metadata.get("abstract"),
+                    pub_date=metadata.get("pub_date"),
+                    authors=metadata.get("authors"),
+                    pdf_path=str(pdf_path),
+                    source_url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                )
+
+                return self._paper_to_dict(paper)
+
+        except Exception as e:
+            await progress_queue.put({
+                'type': 'log',
+                'source': 'pubmed',
+                'content': f' ❌ 错误: {str(e)}\n',
+                'newline': True
+            })
+            return None
+
     async def _fetch_europepmc_papers(
             self,
             query: str,
-            limit: int,
+            target_count: int,
             progress_queue: asyncio.Queue
     ) -> List[Dict]:
-        """检索Europe PMC（持续检索直到满足数量）"""
+        """检索 Europe PMC（优化版本）"""
         results = []
 
         try:
-            records = await search_europe_pmc(query, limit=limit * 5)
+            records = await search_europe_pmc(query, limit=settings.max_pmids_to_fetch)
 
             if not records:
                 await progress_queue.put({
@@ -350,10 +419,24 @@ class OptimizedSearchService:
                 })
                 return results
 
+            await progress_queue.put({
+                'type': 'log',
+                'source': 'europepmc',
+                'content': f'📥 找到 {len(records)} 条记录\n',
+                'newline': True
+            })
+
             # 处理记录
             async with get_db_session() as db:
                 for record in records:
-                    if len(results) >= limit:
+                    # 达到目标数量后停止
+                    if len(results) >= target_count:
+                        await progress_queue.put({
+                            'type': 'log',
+                            'source': 'europepmc',
+                            'content': f'✅ 已获取足够文献（{target_count} 篇），停止检索\n',
+                            'newline': True
+                        })
                         break
 
                     pmid = record.get("pmid")
@@ -385,6 +468,12 @@ class OptimizedSearchService:
 
                     if existing:
                         results.append(self._paper_to_dict(existing))
+                        await progress_queue.put({
+                            'type': 'log',
+                            'source': 'europepmc',
+                            'content': f'  ✓ {pmcid or pmid} 已存在缓存\n',
+                            'newline': True
+                        })
                         continue
 
                     title = record.get("title")
@@ -395,7 +484,7 @@ class OptimizedSearchService:
                         'newline': False
                     })
 
-                    # 下载PDF
+                    # 下载 PDF
                     from pathlib import Path
                     import requests
 
@@ -417,7 +506,7 @@ class OptimizedSearchService:
 
                     def download_pdf():
                         try:
-                            r = requests.get(pdf_url, timeout=60)
+                            r = requests.get(pdf_url, timeout=settings.pdf_download_timeout)
                             if r.status_code == 200 and "pdf" in r.headers.get("content-type", "").lower():
                                 pdf_path.parent.mkdir(parents=True, exist_ok=True)
                                 with open(pdf_path, "wb") as f:
@@ -427,10 +516,13 @@ class OptimizedSearchService:
                             pass
                         return False
 
-                    download_success = await loop.run_in_executor(
-                        self.executor,
-                        download_pdf
-                    )
+                    try:
+                        download_success = await asyncio.wait_for(
+                            loop.run_in_executor(self.executor, download_pdf),
+                            timeout=settings.pdf_download_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        download_success = False
 
                     if not download_success:
                         await progress_queue.put({
@@ -464,6 +556,13 @@ class OptimizedSearchService:
 
                     results.append(self._paper_to_dict(paper))
 
+            await progress_queue.put({
+                'type': 'log',
+                'source': 'europepmc',
+                'content': f'✅ Europe PMC 检索完成，成功获取 {len(results)} 篇文献\n',
+                'newline': True
+            })
+
         except Exception as e:
             await progress_queue.put({
                 'type': 'log',
@@ -480,17 +579,7 @@ class OptimizedSearchService:
             target_count: int,
             progress_queue: asyncio.Queue
     ) -> List[Dict]:
-        """
-        检索并排序临床试验
-
-        Args:
-            keywords: 关键词
-            target_count: 目标试验数量
-            progress_queue: 进度队列
-
-        Returns:
-            排序后的试验列表
-        """
+        """检索并排序临床试验"""
         all_trials = []
 
         await progress_queue.put({
@@ -500,13 +589,13 @@ class OptimizedSearchService:
             'newline': True
         })
 
-        # 1. 先查数据库缓存
+        # 1. 查询缓存
         async with get_db_session() as db:
             keyword_list = [kw.strip() for kw in keywords.split(',') if kw.strip()]
             if keyword_list:
                 query_filter = select(ClinicalTrial).where(
                     or_(*[ClinicalTrial.conditions.ilike(f"%{kw}%") for kw in keyword_list])
-                ).limit(target_count * 3)
+                ).limit(target_count * settings.search_multiplier)
 
                 result = await db.execute(query_filter)
                 cached = result.scalars().all()
@@ -522,9 +611,9 @@ class OptimizedSearchService:
                     for trial in cached:
                         all_trials.append(self._trial_to_dict(trial))
 
-        # 2. 如果缓存不足，执行检索（检索3倍数量）
-        if len(all_trials) < target_count * 3:
-            remaining = target_count * 3 - len(all_trials)
+        # 2. 如果缓存不足，执行检索
+        if len(all_trials) < target_count * settings.search_multiplier:
+            remaining = target_count * settings.search_multiplier - len(all_trials)
 
             try:
                 keyword_list = [kw.strip() for kw in keywords.split(',')]
@@ -533,6 +622,13 @@ class OptimizedSearchService:
                     logic="OR",
                     size=remaining * 2
                 )
+
+                await progress_queue.put({
+                    'type': 'log',
+                    'source': 'clinical_trials',
+                    'content': f'📥 找到 {len(trials)} 个临床试验\n',
+                    'newline': True
+                })
 
                 # 保存到数据库
                 async with get_db_session() as db:
@@ -557,7 +653,7 @@ class OptimizedSearchService:
                         })
 
                         # 保存到数据库
-                        saved_trial = await upsert_clinical_trial(
+                        await upsert_clinical_trial(
                             db,
                             nct_id=trial["nct_id"],
                             title=trial["title"],
@@ -593,7 +689,7 @@ class OptimizedSearchService:
 
         all_trials.sort(key=lambda t: t.get('relevance_score', 0), reverse=True)
 
-        # 4. 返回前N个
+        # 4. 返回前 N 个
         selected_trials = all_trials[:target_count]
 
         await progress_queue.put({
@@ -645,4 +741,4 @@ class OptimizedSearchService:
 
 
 # 全局实例
-optimized_search_service = OptimizedSearchService()
+search_service = SearchService()

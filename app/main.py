@@ -19,7 +19,7 @@ from app.db.database import engine, get_db
 from app.tools.europepmc_client import search_europe_pmc, process_records_and_save_to_db
 from app.models import Base, ClinicalTrial, Paper
 from app.db import crud
-from app.tools.pubmed_client import esearch_pmids, efetch_metadata, get_pdf_from_pubmed
+from app.tools.pubmed_client import pubmed_client
 from app.core.config import settings
 from app.tools.clinical_trials_client import async_search_trials
 
@@ -85,10 +85,10 @@ async def search(request: Request, db: AsyncSession = Depends(get_db)):
         try:
             await progress_queue.put("准备搜索PubMed并获取相关文献")
             # 1. 搜索PMID
-            pmids = await esearch_pmids(q, retmax=limit * 5)
+            pmids = await pubmed_client.esearch_pmids(q, retmax=limit * 5)
             # pmids = []
             # 2. 获取元数据
-            meta = await efetch_metadata(pmids)
+            meta = await pubmed_client.efetch_metadata(pmids)
 
             success_count = 0
             for pid in pmids:
@@ -106,7 +106,13 @@ async def search(request: Request, db: AsyncSession = Depends(get_db)):
 
                 m = meta.get(pid, {})
                 # 调用异步封装（内部用 run_in_executor 调同步函数）, 为了异步调用get_pdf_from_pubmed_sync方法
-                pdf_path = await get_pdf_from_pubmed(pid, m.get("pmcid"), executor, progress_callback)
+                # pdf_path = await get_pdf_from_pubmed(pid, m.get("pmcid"), executor, progress_callback)
+                pdf_path = await pubmed_client.download_pdf_with_limit(
+                    pid,
+                    m.get("pmcid"),
+                    executor,
+                    progress_callback
+                )
                 if not pdf_path:
                     continue
 
