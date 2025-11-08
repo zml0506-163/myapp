@@ -154,3 +154,33 @@ class WorkflowExecution(Base):
     result_message_id: Mapped[int | None] = mapped_column(Integer)  # 关联的消息ID
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class FileCache(Base):
+    """文件缓存表 - 存储已上传到qwen-long的文件信息"""
+    __tablename__ = "file_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # 文件标识
+    file_md5: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(100), nullable=True)
+
+    # qwen-long 文件信息
+    qwen_file_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    qwen_status: Mapped[str] = mapped_column(String(50), nullable=False)  # uploaded, processing, completed, error
+
+    # 验证信息
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_valid: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # 使用统计
+    usage_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # 时间戳
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), onupdate=func.now())

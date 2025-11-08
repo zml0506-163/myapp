@@ -200,4 +200,43 @@ class LLMService:
             yield chunk
 
 
+async def chat_with_files_stream(
+        self,
+        text: str,
+        file_ids: List[str],
+        history: List[dict] = None
+) -> AsyncGenerator[str, None]:
+    """
+    基于多个文件的流式对话（使用 qwen-long + file_ids）
+
+    Args:
+        text: 用户问题
+        file_ids: qwen-long的文件ID列表
+        history: 历史对话
+    """
+    messages = []
+
+    if history:
+        messages.extend(history)
+
+    # 构建system消息（包含file_ids）
+    file_context = ",".join([f"fileid://{fid}" for fid in file_ids])
+    messages.insert(0, {
+        "role": "system",
+        "content": file_context
+    })
+
+    # 添加用户问题
+    messages.append({
+        "role": "user",
+        "content": text
+    })
+
+    async for chunk in self.chat_stream(
+            messages=messages,
+            model=settings.qwen_long_model,
+            system_prompt="你是一个专业的文档分析助手。请仔细阅读提供的文件，并基于文件内容回答问题。"
+    ):
+        yield chunk
+
 llm_service = LLMService()

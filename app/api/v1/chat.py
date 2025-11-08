@@ -222,7 +222,8 @@ async def chat_stream(
                         conversation_id=request.conversation_id,
                         user_id=current_user.id,
                         user_query=request.content,
-                        user_attachments=request.attachments
+                        user_attachments=request.attachments,
+                        is_first_conversation=is_first_conversation
                 ):
                     yield f"data: {json.dumps(output, ensure_ascii=False)}\n\n"
 

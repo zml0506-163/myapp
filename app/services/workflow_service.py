@@ -1,5 +1,5 @@
 """
-工作流服务 - 修复逐字打印版本
+工作流服务
 """
 import os
 import json
@@ -47,9 +47,10 @@ class WorkflowService:
             conversation_id: int,
             user_id: int,
             user_query: str,
-            user_attachments: List[Dict] = None
+            user_attachments: List[Dict] = None,
+            is_first_conversation: bool = False
     ) -> AsyncGenerator[Dict, None]:
-        """执行工作流并流式输出"""
+        """执行工作流并流式输出（添加标题生成）"""
 
         # 创建执行记录
         execution_id = await self._create_execution(conversation_id, user_id)
@@ -74,7 +75,7 @@ class WorkflowService:
         }
 
         try:
-            # 执行步骤
+            # 执行所有步骤
             async for chunk in self._step_extract_features(state):
                 yield chunk
 
@@ -99,6 +100,60 @@ class WorkflowService:
             # 更新执行状态
             await self._update_execution(execution_id, 'completed')
 
+            # === 新增：生成对话标题 ===
+            if is_first_conversation:
+                try:
+                    # 使用患者特征和查询生成标题
+                    title_prompt = f"""请根据以下医疗咨询内容生成一个简短的标题（不超过15个字）：
+        
+用户问题：{user_query}
+
+患者特征：{state['patient_features'][:300]}...
+
+要求：
+1. 突出疾病/症状关键词
+2. 不超过15个字
+3. 直接输出标题，不要有其他内容
+4. 不使用引号、书名号等标点符号
+
+标题："""
+
+                    new_title = ""
+                    messages = [{"role": "user", "content": title_prompt}]
+
+                    async for token in llm_service.chat_stream(
+                            messages=messages,
+                            system_prompt="你是一个专业的标题生成助手。"
+                    ):
+                        new_title += token
+
+                    # 清理标题
+                    new_title = new_title.strip().replace('\n', '').replace('"', '').replace("'", '')
+
+                    if new_title and len(new_title) > 2:
+                        if len(new_title) > 15:
+                            new_title = new_title[:15] + "..."
+
+                        async with get_db_session() as db:
+                            from app.schemas.conversation import ConversationUpdateSchema
+                            from app.crud import conversation as crud_conversation
+                            await crud_conversation.update_conversation(
+                                db,
+                                conversation_id=conversation_id,
+                                conversation_schema=ConversationUpdateSchema(title=new_title),
+                                user_id=user_id
+                            )
+
+                        # 通知前端标题已更新
+                        yield {
+                            'type': 'title_updated',
+                            'conversation_id': conversation_id,
+                            'title': new_title
+                        }
+                        print(f"✅ 多源检索对话已自动重命名为「{new_title}」")
+
+                except Exception as e:
+                    print(f"生成标题失败: {e}")
             yield {'type': 'done', 'content': ''}
 
         except Exception as e:
@@ -110,7 +165,7 @@ class WorkflowService:
             }
 
     async def _step_extract_features(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤1: 提取患者特征"""
+        """步骤1: 提取患者特征（优化附件处理）"""
         state['current_step'] = 'extract_features'
 
         yield {
@@ -135,13 +190,7 @@ class WorkflowService:
 
         context = "\n".join(context_parts)
 
-        # 使用提示词模板
         prompt = self.prompts.extract_features(context, state['user_query'])
-        messages = [{"role": "user", "content": prompt}]
-
-        # 检查是否有图片
-        image_attachments = [att for att in state['user_attachments']
-                             if att.get('mime_type', '').startswith('image/')]
 
         full_response = ""
 
@@ -154,15 +203,34 @@ class WorkflowService:
         }
 
         try:
-            if image_attachments:
-                for att in image_attachments:
+            # 处理附件
+            if state['user_attachments']:
+                from app.services.file_service import file_service
+
+                file_ids, only_images = await file_service.process_attachments(
+                    state['user_attachments']
+                )
+
+                if only_images and len(file_ids) == 1:
+                    # 只有一张图片：使用VL模型
+                    image_att = state['user_attachments'][0]
                     async for token in llm_service.chat_with_image_stream(
                             text=prompt,
-                            image_path=att['file_path'],
+                            image_path=image_att['file_path'],
+                            history=[]
+                    ):
+                        full_response += token
+                else:
+                    # 有多个文件或包含非图片文件：使用qwen-long
+                    async for token in llm_service.chat_with_files_stream(
+                            text=prompt,
+                            file_ids=file_ids,
                             history=[]
                     ):
                         full_response += token
             else:
+                # 无附件：普通对话
+                messages = [{"role": "user", "content": prompt}]
                 async for token in llm_service.chat_stream(messages=messages):
                     full_response += token
 
@@ -310,7 +378,7 @@ class WorkflowService:
         yield {'type': 'section_end', 'step': 'search'}
 
     async def _step_analyze_papers(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
-        """步骤4: 分析文献"""
+        """步骤4: 分析文献（修复qwen-long调用）"""
         state['current_step'] = 'analyze_papers'
 
         yield {
@@ -329,6 +397,8 @@ class WorkflowService:
             }
             yield {'type': 'section_end', 'step': 'analyze_papers'}
             return
+
+        from app.services.file_service import file_service
 
         for i, paper in enumerate(state['papers']):
             yield {
@@ -358,9 +428,15 @@ class WorkflowService:
 
             analysis = ""
             try:
-                async for token in llm_service.chat_with_pdf_stream(
+                # 使用qwen-long + file_id方式
+                file_id = await file_service.get_or_upload_file(pdf_path)
+
+                if not file_id:
+                    raise Exception("文件上传失败")
+
+                async for token in llm_service.chat_with_files_stream(
                         text=prompt,
-                        pdf_path=pdf_path,
+                        file_ids=[file_id],
                         history=[]
                 ):
                     analysis += token
@@ -374,8 +450,8 @@ class WorkflowService:
                     'type': 'result',
                     'step': 'analyze_papers',
                     'content': f"""### 文献 {i+1}: {paper['title']}
-
-{analysis}""",
+    
+    {analysis}""",
                     'data': {
                         'paper_id': paper.get('id'),
                         'pmid': paper.get('pmid'),
