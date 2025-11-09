@@ -1280,16 +1280,38 @@ const formatTime = (timestamp) => {
 }
 
 /* ============================================
-   Markdown 内容样式
-   ============================================ */
-.assistant-text :deep(h1),
-.assistant-text :deep(h2),
-.assistant-text :deep(h3),
+  Markdown 内容样式
+============================================ */
+.assistant-text :deep(h1) {
+  margin-top: 12px;
+  margin-bottom: 8px;
+  font-weight: 600;
+  line-height: 1.3;
+  font-size: 1.5em;  /* 添加这行，原来默认是3.2em */
+}
+
+.assistant-text :deep(h2) {
+  margin-top: 10px;
+  margin-bottom: 6px;
+  font-weight: 600;
+  line-height: 1.3;
+  font-size: 1.3em;  /* 添加这行 */
+}
+
+.assistant-text :deep(h3) {
+  margin-top: 10px;
+  margin-bottom: 6px;
+  font-weight: 600;
+  line-height: 1.3;
+  font-size: 1.1em;  /* 添加这行 */
+}
+
 .assistant-text :deep(h4) {
   margin-top: 10px;
   margin-bottom: 6px;
   font-weight: 600;
   line-height: 1.3;
+  font-size: 1em;  /* 添加这行 */
 }
 
 .assistant-text :deep(p) {

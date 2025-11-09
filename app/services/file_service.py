@@ -172,7 +172,7 @@ class FileService:
                     cached.last_verified_at = func.now()
                     await db.commit()
 
-                    print(f"使用缓存文件: {cached.original_filename} (file_id: {cached.qwen_file_id})")
+                    print(f"✅ 使用缓存文件: {cached.original_filename} (file_id: {cached.qwen_file_id})")
                     return cached.qwen_file_id
                 else:
                     # 标记为无效
@@ -186,13 +186,19 @@ class FileService:
                 upload_path = file_path
 
                 if file_type == 'image':
-
                     # 1. 先检查并调整像素（避免像素超限错误）
                     resized_path = self.resize_image_by_pixels(file_path)
                     file_size = os.path.getsize(resized_path)
+
                     # 2. 再根据文件大小决定是否压缩（大于5MB则压缩）
-                    if file_size > self.MIN_COMPRESS_FILE_SIZE:  # 大于5MB才压缩
+                    if file_size > self.MIN_COMPRESS_FILE_SIZE:
                         upload_path = self.compress_image(resized_path)
+                    else:
+                        upload_path = resized_path
+
+                    print(f"📸 图片处理: {Path(file_path).name} -> {Path(upload_path).name} ({file_size / 1024:.1f}KB)")
+                else:
+                    print(f"📄 准备上传: {Path(file_path).name}")
 
                 # 上传到qwen-long
                 file_object = self.client.files.create(
@@ -200,7 +206,7 @@ class FileService:
                     purpose="file-extract"
                 )
 
-                print(f"文件上传成功: {Path(resized_path).name} -> {file_object.id}")
+                print(f"✅ 文件上传成功: {Path(upload_path).name} -> {file_object.id}")
 
                 # 5. 保存到缓存
                 if cached:
@@ -212,12 +218,12 @@ class FileService:
                     cached.usage_count = 1
                     cached.last_used_at = func.now()
                 else:
-                    # 创建新记录
+                    # 创建新记录（使用原始文件的信息）
                     new_cache = FileCache(
                         file_md5=file_md5,
-                        original_filename=Path(resized_path).name,
-                        file_path=resized_path,
-                        file_size=os.path.getsize(resized_path),
+                        original_filename=Path(file_path).name,  # 使用原始文件名
+                        file_path=file_path,  # 使用原始路径
+                        file_size=os.path.getsize(file_path),
                         mime_type=None,
                         qwen_file_id=file_object.id,
                         qwen_status=file_object.status,
@@ -233,7 +239,9 @@ class FileService:
                 return file_object.id
 
             except Exception as e:
-                print(f"文件上传失败: {e}")
+                print(f"❌ 文件上传失败: {e}")
+                import traceback
+                traceback.print_exc()
                 return None
 
     async def process_attachments(

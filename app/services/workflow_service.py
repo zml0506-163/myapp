@@ -421,10 +421,15 @@ class WorkflowService:
                 async for token in llm_service.chat_with_context(
                         user_query=prompt,
                         file_ids=[file_id],
-                        system_prompt="你是一个专业的医疗文献分析助手。请仔细阅读PDF文档并基于内容回答。",
+                        system_prompt="你是一个专业的医疗文献分析助手。请仔细阅读PDF文档，按照指定格式输出结构化分析。",
                         model=settings.qwen_long_model
                 ):
                     analysis += token
+
+                state['paper_analyses'].append({
+                    'paper': paper,
+                    'analysis': analysis
+                })
 
                 state['paper_analyses'].append({
                     'paper': paper,
