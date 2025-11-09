@@ -201,7 +201,7 @@
                     <!-- 区块内容 -->
                     <div v-show="!section.collapsed" class="section-content">
                       <!-- 日志 -->
-                      <div v-if="section.logs.length > 0" class="logs-container">
+                      <div v-if="section.logs && section.logs.length > 0" class="logs-container">
                         <span
                           v-for="(log, logIdx) in section.logs"
                           :key="`log-${idx}-${logIdx}`"
@@ -211,7 +211,7 @@
                       </div>
                       
                       <!-- 结果 -->
-                      <div v-if="section.results.length > 0" class="results-container">
+                      <div v-if="section.results && section.results.length > 0" class="results-container">
                         <div
                           v-for="(result, resultIdx) in section.results"
                           :key="`result-${idx}-${resultIdx}`"
@@ -639,18 +639,41 @@ const handleSend = async () => {
               workflowSections.value = [...workflowSections.value, currentSection]
               
             } else if (data.type === 'section_end') {
-              if (currentSection && currentSection.collapsible) {
-                // 使用索引更新，确保响应式
+              if (currentSection) {
                 const idx = workflowSections.value.findIndex(s => s.step === currentSection.step)
                 if (idx !== -1) {
-                  workflowSections.value[idx] = { ...currentSection, collapsed: true }
+                  // 保留所有内容，只修改折叠状态
+                  const section = workflowSections.value[idx]
+
+                  // 调试日志
+                  console.log(`[DEBUG] Section ${data.step} ending:`, {
+                    logs_count: section.logs.length,
+                    results_count: section.results.length,
+                    collapsed: section.collapsed
+                  })
+
+                  workflowSections.value[idx] = {
+                    ...section,
+                    collapsed: section.collapsible !== false ? true : false
+                  }
                 }
               }
               currentSection = null
               
             } else if (data.type === 'log') {
-              if (currentSection) {
-                const sectionIdx = workflowSections.value.findIndex(s => s.step === currentSection.step)
+              // 查找当前活跃区块
+              let targetSection = currentSection
+              
+              // 如果没有当前区块，尝试根据 step 查找
+              if (!targetSection && data.step) {
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === data.step)
+                if (sectionIdx !== -1) {
+                  targetSection = workflowSections.value[sectionIdx]
+                }
+              }
+              
+              if (targetSection) {
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === targetSection.step)
                 if (sectionIdx !== -1) {
                   const section = workflowSections.value[sectionIdx]
                   
@@ -678,10 +701,19 @@ const handleSend = async () => {
                   }
                 }
               }
-              
             } else if (data.type === 'result') {
-              if (currentSection) {
-                const sectionIdx = workflowSections.value.findIndex(s => s.step === currentSection.step)
+              // 查找目标区块
+              let targetSection = currentSection
+              
+              if (!targetSection && data.step) {
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === data.step)
+                if (sectionIdx !== -1) {
+                  targetSection = workflowSections.value[sectionIdx]
+                }
+              }
+              
+              if (targetSection) {
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === targetSection.step)
                 if (sectionIdx !== -1) {
                   const section = workflowSections.value[sectionIdx]
                   
@@ -702,7 +734,6 @@ const handleSend = async () => {
                   }
                 }
               }
-              
             } else if (data.type === 'token') {
               // === 普通模式：逐字追加 ===
               if (isWorkflowMode.value) {
