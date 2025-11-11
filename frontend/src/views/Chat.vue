@@ -113,11 +113,6 @@
       <!-- 头部 -->
       <div class="chat-header">
         <h1>{{ getCurrentChatTitle() }}</h1>
-        
-        <!-- 多源检索开关 -->
-        <div class="multi-source-toggle">
-          <el-checkbox v-model="enableMultiSource" label="多源检索" size="large" />
-        </div>
       </div>
 
       <!-- 消息区域 -->
@@ -152,9 +147,12 @@
                     :key="att.id"
                     type="info"
                     size="small"
+                    class="attachment-tag"
+                    @click="handleDownloadAttachment(att)"
                   >
                     <el-icon style="margin-right: 4px"><Paperclip /></el-icon>
-                    {{ att.original_filename }}
+                    <span class="attachment-name">{{ att.original_filename }}</span>
+                    <el-icon style="margin-left: 4px" class="download-icon"><Download /></el-icon>
                   </el-tag>
                 </div>
               </div>
@@ -284,10 +282,20 @@
                     :disabled="!chatStore.currentConversationId || isSending"
                     accept=".pdf,.png,.jpg,.jpeg,.webp"
                   >
-                    <el-button text title="上传附件" :disabled="!chatStore.currentConversationId || isSending">
+                    <el-button text title="上传附件" :disabled="!chatStore.currentConversationId || isSending" class="upload-btn">
                       <el-icon><Paperclip /></el-icon>
+                      <span class="btn-text">上传附件</span>
                     </el-button>
                   </el-upload>
+                  
+                  <!-- 多源检索开关 -->
+                  <div class="multi-source-switch">
+                    <el-switch 
+                      v-model="enableMultiSource" 
+                      active-text="多源检索"
+                      :disabled="!chatStore.currentConversationId || isSending"
+                    />
+                  </div>
                 </div>
                 
                 <div class="toolbar-right">
@@ -300,7 +308,7 @@
                     class="stop-btn"
                     title="停止生成"
                   >
-                    <el-icon><CircleClose /></el-icon>
+                    <el-icon :size="18"><CircleClose /></el-icon>
                   </el-button>
                   
                   <!-- 发送按钮 -->
@@ -339,7 +347,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick, onMounted, watch } from 'vue'
+import { ref, nextTick, onMounted, watch, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
@@ -359,7 +367,9 @@ import {
   MoreFilled,
   SwitchButton,
   ArrowUp,
-  CircleClose
+  CircleClose,
+  Download,
+  View
 } from '@element-plus/icons-vue'
 import { useUserStore } from '@/stores/user'
 import { useChatStore } from '@/stores/chat'
@@ -382,17 +392,29 @@ const renamingChatId = ref(null)
 const isRenaming = ref(false)
 const isSending = ref(false)
 const isAITyping = ref(false)
-const enableMultiSource = ref(false)
+const enableMultiSource = ref(true)
 const workflowDone = ref(false)
 const workflowSections = ref([])  // 改用 ref
 const simpleResponse = ref('')  // 用于普通模式的纯文本响应
 const isWorkflowMode = ref(false)  //标识当前是否为工作流模式
 const currentReader = ref(null)  // 用于存储当前的 Reader，以便停止
+const shouldAutoScroll = ref(true)  // 是否自动滚动到底部
 
 // 监听对话切换，清空附件
 watch(() => chatStore.currentConversationId, () => {
   conversationAttachments.value = []
+  shouldAutoScroll.value = true  // 切换对话时重置自动滚动
 })
+
+// 页面刷新前确认（移除提示）
+const handleBeforeUnload = (e) => {
+  // 不再显示任何提示，让用户自由刷新/离开
+  // if (isSending.value) {
+  //   e.preventDefault()
+  //   e.returnValue = '当前正在生成回答，刷新页面将中断回答，确定要离开吗？'
+  //   return e.returnValue
+  // }
+}
 
 // 初始化
 onMounted(async () => {
@@ -406,10 +428,35 @@ onMounted(async () => {
     if (chatStore.conversations.length > 0 && !chatStore.currentConversationId) {
       await chatStore.switchConversation(chatStore.conversations[0].id)
     }
+    
+    // 检测是否有生成中的消息需要重连
+    await checkAndReconnect()
+    
+    // 添加页面刷新监听
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    
+    // 添加滚动监听
+    if (chatMainRef.value) {
+      chatMainRef.value.addEventListener('scroll', handleScroll)
+    }
   } catch (error) {
     console.error('初始化失败:', error)
     ElMessage.error('加载数据失败，请刷新页面重试')
   }
+})
+
+// 组件卸载时移除监听
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', handleBeforeUnload)
+  if (chatMainRef.value) {
+    chatMainRef.value.removeEventListener('scroll', handleScroll)
+  }
+})
+
+// Markdown 渲染配置
+marked.setOptions({
+  breaks: true,  // 支持 GitHub 风格的换行
+  gfm: true      // 启用 GitHub Flavored Markdown
 })
 
 // Markdown 渲染
@@ -419,13 +466,36 @@ const renderMarkdown = (content) => {
   return DOMPurify.sanitize(html)
 }
 
-// 滚动到底部
+// 检查是否在底部（容差5px）
+const isAtBottom = () => {
+  if (!chatMainRef.value) return false
+  const { scrollTop, scrollHeight, clientHeight } = chatMainRef.value
+  return scrollHeight - scrollTop - clientHeight < 5
+}
+
+// 滚动到底部（仅在应该自动滚动时）
 const scrollToBottom = () => {
+  if (!shouldAutoScroll.value) return
+  
   nextTick(() => {
     if (chatMainRef.value) {
       chatMainRef.value.scrollTop = chatMainRef.value.scrollHeight
     }
   })
+}
+
+// 监听用户滚动
+const handleScroll = () => {
+  if (!chatMainRef.value) return
+  if (isSending.value) {  // 只在生成过程中监听用户滚动
+    // 检查用户是否滚动到底部
+    if (isAtBottom()) {
+      shouldAutoScroll.value = true
+    } else {
+      // 用户向上滚动了，禁用自动滚动
+      shouldAutoScroll.value = false
+    }
+  }
 }
 
 // 调整输入框高度
@@ -441,8 +511,21 @@ const adjustTextareaHeight = () => {
 // 创建新对话
 const handleCreateNewChat = async () => {
   try {
-    await chatStore.createNewConversation('新对话')
+    const conversation = await chatStore.createNewConversation('新对话')
     conversationAttachments.value = []
+    
+    // 添加欢迎消息
+    const welcomeMessage = {
+      id: Date.now(),
+      conversation_id: conversation.id,
+      content: "您好！欢迎使用 PubMed 多来源检索系统。\n\n我可以帮您：\n1. 检索 PubMed、Europe PMC 等数据库的医学文献\n2. 分析临床试验信息\n3. 解读医学文档内容\n\n请输入您的问题开始检索，或上传文档进行分析。",
+      message_type: 'assistant',
+      status: 'completed',
+      created_at: new Date().toISOString()
+    }
+    
+    // 将欢迎消息添加到消息列表
+    chatStore.messages.push(welcomeMessage)
   } catch (error) {
     console.error('创建对话失败:', error)
   }
@@ -450,15 +533,18 @@ const handleCreateNewChat = async () => {
 
 // 切换对话
 const handleSwitchChat = async (chatId) => {
+  // 移除确认提示，直接停止并切换
   if (isSending.value) {
-    ElMessage.warning('请等待当前消息发送完成')
-    return
+    // 停止当前生成
+    await handleStop()
   }
   
   try {
     await chatStore.switchConversation(chatId)
     conversationAttachments.value = []
     scrollToBottom()
+    // 检测是否有生成中的消息
+    await checkAndReconnect()
   } catch (error) {
     console.error('切换对话失败:', error)
   }
@@ -546,6 +632,269 @@ const handleStop = async () => {
   }
 }
 
+// 检测并重连生成中的消息
+const checkAndReconnect = async () => {
+  // 查找最后一条assistant消息
+  const messages = chatStore.messages
+  if (messages.length === 0) return
+  
+  // 从后往前查找第一条assistant消息
+  let lastAIMessage = null
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].message_type === 'assistant') {
+      lastAIMessage = messages[i]
+      break
+    }
+  }
+  
+  if (!lastAIMessage) return
+  
+  // 检查状态
+  if (lastAIMessage.status === 'generating') {
+    console.log('检测到生成中的消息，正在重连...', lastAIMessage.id)
+    // 确保清空之前的状态，避免出现空白框
+    workflowSections.value = []
+    simpleResponse.value = ''
+    isAITyping.value = false
+    
+    await reconnectStream(lastAIMessage.id)
+  }
+}
+
+// 重连流式接口
+const reconnectStream = async (messageId) => {
+  isSending.value = true
+  isAITyping.value = true
+  workflowDone.value = false
+  workflowSections.value = []
+  simpleResponse.value = ''
+  
+  try {
+    const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
+    const token = localStorage.getItem('chat_token')
+    
+    const response = await fetch(`${baseURL}/chat/stream/continue/${messageId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`
+      }
+    })
+    
+    if (!response.ok) {
+      throw new Error('重连失败')
+    }
+    
+    const reader = response.body.getReader()
+    currentReader.value = reader
+    const decoder = new TextDecoder()
+    
+    let currentSection = null
+    
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      
+      const chunk = decoder.decode(value, { stream: true })
+      const lines = chunk.split('\n')
+      
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.slice(6))
+            
+            // 复用事件处理逻辑
+            if (data.type === 'section_start') {
+              currentSection = {
+                step: data.step,
+                title: data.title,
+                collapsible: data.collapsible !== false,
+                collapsed: false,
+                logs: [],
+                results: [],
+                summary: ''
+              }
+              workflowSections.value = [...workflowSections.value, currentSection]
+              isWorkflowMode.value = true
+              
+            } else if (data.type === 'section_end') {
+              if (currentSection) {
+                const idx = workflowSections.value.findIndex(s => s.step === currentSection.step)
+                if (idx !== -1) {
+                  const section = workflowSections.value[idx]
+                  workflowSections.value[idx] = {
+                    ...section,
+                    collapsed: section.collapsible !== false ? true : false
+                  }
+                }
+              }
+              currentSection = null
+              
+            } else if (data.type === 'log') {
+              let targetSection = currentSection
+              
+              if (data.source === 'attachment' && !targetSection) {
+                const attachmentSectionIdx = workflowSections.value.findIndex(s => s.step === 'attachment_processing')
+                if (attachmentSectionIdx !== -1) {
+                  targetSection = workflowSections.value[attachmentSectionIdx]
+                }
+              }
+              
+              if (!targetSection && data.step) {
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === data.step)
+                if (sectionIdx !== -1) {
+                  targetSection = workflowSections.value[sectionIdx]
+                }
+              }
+              
+              if (targetSection) {
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === targetSection.step)
+                if (sectionIdx !== -1) {
+                  const section = workflowSections.value[sectionIdx]
+                  
+                  if (data.newline === false && section.logs.length > 0) {
+                    const lastIdx = section.logs.length - 1
+                    const updatedLogs = [...section.logs]
+                    updatedLogs[lastIdx] = {
+                      ...updatedLogs[lastIdx],
+                      content: updatedLogs[lastIdx].content + data.content
+                    }
+                    workflowSections.value[sectionIdx] = {
+                      ...section,
+                      logs: updatedLogs
+                    }
+                  } else {
+                    workflowSections.value[sectionIdx] = {
+                      ...section,
+                      logs: [...section.logs, {
+                        content: data.content,
+                        source: data.source
+                      }]
+                    }
+                  }
+                }
+              }
+              
+            } else if (data.type === 'result') {
+              let targetSection = currentSection
+              
+              if (!targetSection && data.step) {
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === data.step)
+                if (sectionIdx !== -1) {
+                  targetSection = workflowSections.value[sectionIdx]
+                }
+              }
+              
+              if (targetSection) {
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === targetSection.step)
+                if (sectionIdx !== -1) {
+                  const section = workflowSections.value[sectionIdx]
+                  
+                  const updates = {}
+                  if (data.content !== undefined) {
+                    if (section.results && section.results.length > 0) {
+                      const updatedResults = [...section.results]
+                      
+                      if (data.is_incremental) {
+                        updatedResults[updatedResults.length - 1] = {
+                          content: updatedResults[updatedResults.length - 1].content + data.content,
+                          data: data.data
+                        }
+                      } else {
+                        updatedResults[updatedResults.length - 1] = {
+                          content: data.content,
+                          data: data.data
+                        }
+                      }
+                      
+                      updates.results = updatedResults
+                    } else {
+                      updates.results = [{
+                        content: data.content,
+                        data: data.data
+                      }]
+                    }
+                  }
+                  if (data.summary) {
+                    updates.summary = data.summary
+                  }
+                  
+                  workflowSections.value[sectionIdx] = {
+                    ...section,
+                    ...updates
+                  }
+                }
+              }
+              
+            } else if (data.type === 'token') {
+              if (isWorkflowMode.value) {
+                if (!currentSection) {
+                  currentSection = {
+                    step: 'final_report',
+                    title: '📝 最终报告',
+                    collapsible: false,
+                    collapsed: false,
+                    logs: [],
+                    results: [{ content: '', data: null }],
+                    summary: ''
+                  }
+                  workflowSections.value = [...workflowSections.value, currentSection]
+                }
+                
+                const sectionIdx = workflowSections.value.findIndex(s => s.step === currentSection.step)
+                if (sectionIdx !== -1 && workflowSections.value[sectionIdx].results.length > 0) {
+                  const section = workflowSections.value[sectionIdx]
+                  const updatedResults = [...section.results]
+                  updatedResults[0] = {
+                    ...updatedResults[0],
+                    content: updatedResults[0].content + data.content
+                  }
+                  workflowSections.value[sectionIdx] = {
+                    ...section,
+                    results: updatedResults
+                  }
+                }
+              } else {
+                simpleResponse.value += data.content
+              }
+              
+            } else if (data.type === 'done') {
+              workflowDone.value = true
+              isAITyping.value = false
+              isSending.value = false
+              currentReader.value = null
+              await chatStore.fetchMessages(chatStore.currentConversationId)
+              
+            } else if (data.type === 'error') {
+              ElMessage.error(data.content)
+              isAITyping.value = false
+              isSending.value = false
+              workflowDone.value = true
+              currentReader.value = null
+            } else {
+              // 忽略未知类型，避免显示调试信息
+              console.warn('未知的 SSE 事件类型:', data.type, data)
+            }
+            
+            await nextTick()
+            scrollToBottom()
+            
+          } catch (e) {
+            console.error('解析SSE消息失败:', e, line)
+          }
+        }
+      }
+    }
+    
+    currentReader.value = null
+    
+  } catch (error) {
+    console.error('重连失败:', error)
+    ElMessage.error('重连失败')
+    isSending.value = false
+    isAITyping.value = false
+  }
+}
+
 // 发送消息
 const handleSend = async () => {
   if (!inputValue.value.trim()) return
@@ -574,16 +923,39 @@ const handleSend = async () => {
   isSending.value = true
   isAITyping.value = true
   workflowDone.value = false
+  shouldAutoScroll.value = true  // 新问题开始时启用自动滚动
   
   // 清空之前的状态
   workflowSections.value = []
   simpleResponse.value = ''
   isWorkflowMode.value = (mode === 'multi_source')
   
+  // 如果是附件模式，创建附件处理日志区块
+  if (mode === 'attachment') {
+    workflowSections.value = [{
+      step: 'attachment_processing',
+      title: '📎 附件处理',
+      collapsible: true,
+      collapsed: false,
+      logs: [],
+      results: [],
+      summary: ''
+    }]
+  }
+  
   try {
     // 刷新发送消息页面样式
     await chatStore.sendUserMessage(content, conversationAttachments.value)
     scrollToBottom()
+    
+    // 如果有附件，显示处理提示
+    if (conversationAttachments.value.length > 0) {
+      ElMessage({
+        message: `正在处理 ${conversationAttachments.value.length} 个附件...`,
+        type: 'info',
+        duration: 2000
+      })
+    }
     
     // 调用流式 API
     const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
@@ -664,6 +1036,14 @@ const handleSend = async () => {
               // 查找当前活跃区块
               let targetSection = currentSection
               
+              // 如果是附件处理日志，使用attachment_processing区块
+              if (data.source === 'attachment' && !targetSection) {
+                const attachmentSectionIdx = workflowSections.value.findIndex(s => s.step === 'attachment_processing')
+                if (attachmentSectionIdx !== -1) {
+                  targetSection = workflowSections.value[attachmentSectionIdx]
+                }
+              }
+              
               // 如果没有当前区块，尝试根据 step 查找
               if (!targetSection && data.step) {
                 const sectionIdx = workflowSections.value.findIndex(s => s.step === data.step)
@@ -717,12 +1097,34 @@ const handleSend = async () => {
                 if (sectionIdx !== -1) {
                   const section = workflowSections.value[sectionIdx]
                   
+                  // 流式更新：判断是增量还是完整
                   const updates = {}
-                  if (data.content) {
-                    updates.results = [...section.results, {
-                      content: data.content,
-                      data: data.data
-                    }]
+                  if (data.content !== undefined) {
+                    if (section.results && section.results.length > 0) {
+                      const updatedResults = [...section.results]
+                      
+                      if (data.is_incremental) {
+                        // 增量：累加
+                        updatedResults[updatedResults.length - 1] = {
+                          content: updatedResults[updatedResults.length - 1].content + data.content,
+                          data: data.data
+                        }
+                      } else {
+                        // 完整：替换
+                        updatedResults[updatedResults.length - 1] = {
+                          content: data.content,
+                          data: data.data
+                        }
+                      }
+                      
+                      updates.results = updatedResults
+                    } else {
+                      // 新建结果
+                      updates.results = [{
+                        content: data.content,
+                        data: data.data
+                      }]
+                    }
                   }
                   if (data.summary) {
                     updates.summary = data.summary
@@ -791,6 +1193,9 @@ const handleSend = async () => {
               isAITyping.value = false
               workflowDone.value = true
               currentReader.value = null
+            } else {
+              // 忽略未知类型，避免显示调试信息
+              console.warn('未知的 SSE 事件类型:', data.type, data)
             }
             
             await nextTick()
@@ -836,6 +1241,13 @@ const handleKeyDown = (e) => {
 
 // 处理文件选择
 const handleFileChange = async (file) => {
+  const loadingMessage = ElMessage({
+    message: '正在上传文件...',
+    type: 'info',
+    duration: 0, // 不自动关闭
+    showClose: true
+  })
+  
   try {
     const uploadedFile = await uploadFile(file.raw)
     
@@ -848,9 +1260,11 @@ const handleFileChange = async (file) => {
       file_path: uploadedFile.file_path
     })
     
-    ElMessage.success('文件上传成功')
+    loadingMessage.close()
+    ElMessage.success(`${uploadedFile.original_filename} 上传成功`)
   } catch (error) {
     console.error('文件上传失败:', error)
+    loadingMessage.close()
     ElMessage.error('文件上传失败')
   }
 }
@@ -894,6 +1308,35 @@ const formatTime = (timestamp) => {
   if (hours < 24) return `${hours}小时前`
   if (days < 7) return `${days}天前`
   return time.toLocaleDateString('zh-CN')
+}
+
+// 处理附件下载
+const handleDownloadAttachment = async (attachment) => {
+  try {
+    const { downloadFile } = await import('@/api/upload')
+    
+    // 调用下载接口，获取blob数据
+    const blob = await downloadFile(attachment.filename)
+    
+    // 创建临时URL
+    const url = window.URL.createObjectURL(blob)
+    
+    // 创建一个隐藏的a标签进行下载
+    const link = document.createElement('a')
+    link.href = url
+    link.download = attachment.original_filename || attachment.filename
+    document.body.appendChild(link)
+    link.click()
+    
+    // 清理
+    document.body.removeChild(link)
+    window.URL.revokeObjectURL(url)
+    
+    ElMessage.success(`开始下载: ${attachment.original_filename || attachment.filename}`)
+  } catch (error) {
+    console.error('下载失败:', error)
+    ElMessage.error('下载失败，请稍后重试')
+  }
 }
 </script>
 
@@ -1279,6 +1722,34 @@ const formatTime = (timestamp) => {
   gap: 4px;
 }
 
+.attachment-tag {
+  cursor: pointer;
+  transition: all 0.2s;
+  display: inline-flex;
+  align-items: center;
+}
+
+.attachment-tag:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.attachment-tag .attachment-name {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-tag .download-icon {
+  opacity: 0.6;
+  transition: opacity 0.2s;
+}
+
+.attachment-tag:hover .download-icon {
+  opacity: 1;
+}
+
 /* ============================================
   Markdown 内容样式
 ============================================ */
@@ -1319,10 +1790,31 @@ const formatTime = (timestamp) => {
   line-height: 1.6;
 }
 
+.assistant-text :deep(strong) {
+  font-weight: 600;
+  color: #303133;
+}
+
+.assistant-text :deep(em) {
+  font-style: italic;
+  color: #606266;
+}
+
 .assistant-text :deep(ul),
 .assistant-text :deep(ol) {
   margin: 6px 0;
   padding-left: 20px;
+}
+
+.assistant-text :deep(li) {
+  margin: 4px 0;
+  line-height: 1.6;
+}
+
+.assistant-text :deep(hr) {
+  border: none;
+  border-top: 1px solid #e4e7ed;
+  margin: 12px 0;
 }
 
 .assistant-text :deep(code) {
@@ -1570,7 +2062,8 @@ const formatTime = (timestamp) => {
 }
 
 .custom-textarea:disabled {
-  background-color: #f5f7fa;
+  background-color: #fafafa;
+  color: #909399;
   cursor: not-allowed;
 }
 
@@ -1585,12 +2078,43 @@ const formatTime = (timestamp) => {
 .toolbar-right {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 8px;
 }
 
-.send-btn,
-.stop-btn {
+.upload-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: #606266;
+  font-size: 14px;
+}
+
+.upload-btn:hover {
+  color: #409eff;
+}
+
+.upload-btn .btn-text {
+  font-size: 14px;
+}
+
+.multi-source-switch {
+  display: flex;
+  align-items: center;
+  margin-left: 8px;
+}
+
+.send-btn {
   border-radius: 8px;
+}
+
+.stop-btn {
+  border-radius: 6px !important;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .input-hint {

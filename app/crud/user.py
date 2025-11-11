@@ -3,6 +3,7 @@ from sqlalchemy import select
 from app.models import User
 from app.schemas.user import UserCreateSchema
 from app.core.security import get_password_hash, verify_password
+from app.core.logger import logger
 
 async def get_user_by_id(db: AsyncSession, user_id: int) -> User | None:
     """通过 ID 获取用户"""
@@ -37,7 +38,9 @@ async def authenticate_user(db: AsyncSession, username: str, password: str) -> U
     """验证用户"""
     user = await get_user_by_username(db, username)
     if not user:
+        logger.warning(f"登录失败 - 用户名不存在: {username}")
         return None
     if not verify_password(password, user.hashed_password):
+        logger.warning(f"登录失败 - 密码错误: {username}")
         return None
     return user

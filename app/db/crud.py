@@ -7,18 +7,25 @@ from sqlalchemy import select, desc, func, and_
 from app.models import Paper, ClinicalTrial
 
 
-async def upsert_paper(db: AsyncSession, *, pmid: str | None, pmcid: str, title: str,
+async def upsert_paper(db: AsyncSession, *, pmid: str | None, pmcid: str | None, title: str,
                        source_type: str,
-                       abstract: str | None, pub_date, authors, pdf_path: str,
+                       abstract: str | None, pub_date, authors, pdf_path: str | None,
                        source_url: str | None):
+
+    # 确保至少有一个 ID
+    if pmid is None and pmcid is None:
+        raise ValueError("pmid 和 pmcid 不能同时为 None")
 
     source_condition = Paper.source_type == source_type
     if pmid is not None:
         # 如果 pmid 存在，用 pmid + source 条件查询
         query = select(Paper).where(and_(Paper.pmid == pmid, source_condition))
-    else:
-        # 如果 pmid 是 None，用 pmcid + source 条件查询（需确保 pmcid 不为 None）
+    elif pmcid is not None:
+        # 如果 pmid 是 None 但 pmcid 存在，用 pmcid + source 条件查询
         query = select(Paper).where(and_(Paper.pmcid == pmcid, source_condition))
+    else:
+        # 理论上不会到达这里（因为前面已经检查）
+        raise ValueError("无法构建查询条件")
     result = await db.execute(query)
     existing = result.scalar_one_or_none()
 
@@ -55,7 +62,7 @@ async def list_papers(
         pmid: Optional[str] = None,
         title: Optional[str] = None,
         author: Optional[str] = None
-) -> Tuple[List[Paper], int]:
+) -> Tuple[Sequence[Paper], int]:
     """
     分页查询文献列表，支持多条件搜索
     返回：(文献列表, 总条数)

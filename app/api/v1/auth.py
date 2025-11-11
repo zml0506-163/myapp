@@ -4,6 +4,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.logger import logger
 from app.db.database import get_db
 from app.schemas.user import UserResponseSchema, UserCreateSchema
 from app.schemas.auth import TokenSchema
@@ -46,6 +47,8 @@ async def login(
         db: AsyncSession = Depends(get_db)
 ):
     """用户登录"""
+    logger.info(f"用户尝试登录: {form_data.username}")
+    
     user = await crud_user.authenticate_user(
         db,
         username=form_data.username,
@@ -53,16 +56,18 @@ async def login(
     )
 
     if not user:
+        logger.warning(f"登录失败 - 用户名或密码错误: {form_data.username}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="用户名或密码错误",
+            detail="登录验证失败,请输入正确的账号密码",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
     if not user.is_active:
+        logger.warning(f"登录失败 - 用户已被禁用: {form_data.username}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="用户已被禁用"
+            detail="登录验证失败,请输入正确的账号密码"
         )
 
     # 创建访问令牌
@@ -76,6 +81,8 @@ async def login(
             "is_active": user.is_active
         }, expires_delta=access_token_expires
     )
+    
+    logger.info(f"用户登录成功: {user.username} (ID: {user.id})")
 
     return TokenSchema(
         access_token=access_token,

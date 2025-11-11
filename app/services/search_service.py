@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.db.database import get_db_session
 from app.models import Paper, ClinicalTrial
 from app.db.crud import upsert_paper, upsert_clinical_trial
+from app.utils.storage_helper import storage_helper
 
 from app.tools.pubmed_client import pubmed_client
 from app.tools.europepmc_client import search_europe_pmc
@@ -135,15 +136,20 @@ class SearchService:
                 self._fetch_europepmc_papers(query, target_count, progress_queue)
             )
 
-            pubmed_papers, europepmc_papers = await asyncio.gather(
+            results = await asyncio.gather(
                 pubmed_task,
                 europepmc_task,
                 return_exceptions=True
             )
 
-            if not isinstance(pubmed_papers, Exception):
+            # 处理 PubMed 结果
+            pubmed_papers = results[0]
+            if isinstance(pubmed_papers, list):
                 all_papers.extend(pubmed_papers)
-            if not isinstance(europepmc_papers, Exception):
+            
+            # 处理 Europe PMC 结果
+            europepmc_papers = results[1]
+            if isinstance(europepmc_papers, list):
                 all_papers.extend(europepmc_papers)
 
         # 3. 去重
@@ -477,6 +483,16 @@ class SearchService:
                         continue
 
                     title = record.get("title")
+                    
+                    if not title:
+                        await progress_queue.put({
+                            'type': 'log',
+                            'source': 'europepmc',
+                            'content': f'  ⚠️ {pmcid or pmid} 缺少标题，跳过\n',
+                            'newline': True
+                        })
+                        continue
+                    
                     await progress_queue.put({
                         'type': 'log',
                         'source': 'europepmc',
@@ -488,19 +504,19 @@ class SearchService:
                     from pathlib import Path
                     import requests
 
-                    pdf_url = f"https://europepmc.org/articles/{pmcid}?pdf=render" if pmcid else None
-
-                    if not pdf_url:
+                    if not pmcid:
                         await progress_queue.put({
                             'type': 'log',
                             'source': 'europepmc',
-                            'content': ' ⚠️ 无PDF\n',
+                            'content': ' ⚠️ 无PMCID，无法下载PDF\n',
                             'newline': True
                         })
                         continue
+                    
+                    pdf_url = f"https://europepmc.org/articles/{pmcid}?pdf=render"
 
                     filename = f"europepmc_{pmcid or pmid}.pdf"
-                    pdf_path = Path(settings.pdf_dir) / filename
+                    pdf_path = storage_helper.get_pdf_storage_path('europepmc', filename)
 
                     loop = asyncio.get_running_loop()
 

@@ -4,7 +4,7 @@ import requests
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from app.db import crud
+from app.db import crud  # 数据库操作
 from app.core.config import settings
 from app.db.database import AsyncSessionLocal
 
@@ -99,7 +99,9 @@ async def process_records_and_save_to_db(records, limit, progress_queue) -> int:
             if pdf_url:
                 loop = asyncio.get_running_loop()
                 await progress_queue.put(("MESSAGE", f', 下载PDF...', False))
-                download_success = await loop.run_in_executor(None, lambda: download_pdf(pdf_url, pdf_path))
+                # 确保 pdf_url 类型为 str（非 None）
+                url_to_download: str = pdf_url
+                download_success = await loop.run_in_executor(None, lambda: download_pdf(url_to_download, pdf_path))
                 if not download_success:
                     await progress_queue.put(("MESSAGE", f"失败！", False))
                     continue

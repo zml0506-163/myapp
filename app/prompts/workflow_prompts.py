@@ -40,12 +40,20 @@ class WorkflowPrompts:
 - [ ] 严重肝肾功能不全
 - [ ] 其他排除条件...
 
-请以结构化、清晰的方式列出这些信息。如果某些信息未提及，请标注"未提及"。"""
+---
+
+### ⚠️ 重要：输出格式约定
+
+**如果无法提取到有效的患者特征，请直接输出**：
+
+EXTRACT_FAILED: 无法从提供的信息中提取出有效的患者特征，请提供更详细的疾病信息、基因检测结果或治疗历史。
+
+**如果成功提取，请以结构化的方式列出这些信息**。如果某些信息未提及，请标注“未提及”。"""
 
     @staticmethod
     def generate_queries(patient_features: str) -> str:
         """生成检索条件的提示词"""
-        return f"""基于以下患者特征，生成精确的检索条件：
+        return f"""基于以下患者特征，生成精确且适度的检索条件：
 
 ### 患者特征
 {patient_features}
@@ -53,18 +61,33 @@ class WorkflowPrompts:
 ### 任务
 请生成以下检索条件：
 
-1. **PubMed 检索表达式**: 使用布尔运算符（AND、OR），构建精确的检索式，确保能检索到相关文献
-2. **ClinicalTrials.gov 关键词**: 提取3-5个核心关键词，用逗号分隔
+1. **PubMed 检索表达式**: 使用布尔运算符（AND、OR）和 MeSH 主题词[Mesh]，例如：
+   - `"Small Cell Lung Cancer"[Mesh] AND "Durvalumab"[All Fields]`
+   - 注意：**只保留核心检索条件**，不要过度限制（如只针对疾病名称 + 1-2个关键词）
 
-**输出格式（必须严格遵守JSON格式）**:
-```json
+2. **Europe PMC 检索关键词**: 提取3-5个核心关键词，用逗号分隔，例如：
+   - `small cell lung cancer, extensive stage, PIK3CA`
+   - 注意：Europe PMC 不支持复杂的布尔表达式，只使用简单关键词
+
+3. **ClinicalTrials.gov 关键词**: 提取3-5个核心关键词，用逗号分隔
+
+---
+
+### ⚠️ 重要：输出格式约定
+
+**如果无法生成有效的检索条件（比如患者特征为空或不包含医疗信息），请直接输出**：
+
+GENERATE_FAILED: 无法根据提供的信息生成检索条件，请提供更具体的疾病、基因或治疗信息。
+
+**如果成功生成，必须严格遵守JSON格式**：
+
 {{
-    "pubmed_query": "这里是PubMed检索表达式",
+    "pubmed_query": "这里是PubMed检索表达式，使用MeSH和布尔运算符",
+    "europepmc_query": "这里是Europe PMC关键词，用逗号分隔",
     "clinical_trial_keywords": "关键词1,关键词2,关键词3"
 }}
-```
 
-只输出JSON，不要有其他内容。"""
+只输出 JSON 或 GENERATE_FAILED 标记，不要有其他内容。"""
 
     @staticmethod
     def analyze_paper(patient_features: str, user_query: str, paper: dict) -> str:

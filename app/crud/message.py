@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete
 from sqlalchemy.sql import func
-from app.models import Message, Attachment, Conversation
+from app.models import Message, Attachment, Conversation, MessageStatus, MessageType
 from app.schemas.message import MessageCreateSchema
 
 async def get_messages_by_conversation(
@@ -41,6 +41,8 @@ async def get_messages_by_conversation(
             "conversation_id": msg.conversation_id,
             "content": msg.content,
             "message_type": msg.message_type,
+            "status": msg.status,
+            "metadata": msg.metadata_json,  # 添加元数据
             "created_at": msg.created_at,
             "attachments": [
                 {
@@ -60,7 +62,9 @@ async def get_messages_by_conversation(
 async def create_message(
         db: AsyncSession,
         message_schema: MessageCreateSchema,
-        user_id: int
+        user_id: int,
+        status: MessageStatus = MessageStatus.COMPLETED,
+        metadata_json: str | None = None  # 添加元数据参数
 ) -> dict | None:
     """创建消息"""
     # 验证对话属于该用户
@@ -78,7 +82,9 @@ async def create_message(
     db_message = Message(
         conversation_id=message_schema.conversation_id,
         content=message_schema.content,
-        message_type=message_schema.message_type
+        message_type=message_schema.message_type,
+        status=status,
+        metadata_json=metadata_json  # 添加元数据
     )
     db.add(db_message)
     await db.flush()  # 获取消息 ID
@@ -122,9 +128,50 @@ async def create_message(
         "conversation_id": db_message.conversation_id,
         "content": db_message.content,
         "message_type": db_message.message_type,
+        "status": db_message.status,
+        "metadata": db_message.metadata_json,  # 添加元数据
         "created_at": db_message.created_at,
         "attachments": attachments_data
     }
+
+
+async def get_message_by_id(db: AsyncSession, message_id: int) -> Message | None:
+    """获取消息"""
+    result = await db.execute(
+        select(Message).where(Message.id == message_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def update_message(
+        db: AsyncSession,
+        message_id: int,
+        content: str,
+        status: MessageStatus = MessageStatus.COMPLETED
+) -> bool:
+    """更新消息内容和状态"""
+    await db.execute(
+        update(Message)
+        .where(Message.id == message_id)
+        .values(content=content, status=status)
+    )
+    await db.commit()
+    return True
+
+
+async def update_message_status(
+        db: AsyncSession,
+        message_id: int,
+        status: MessageStatus
+) -> bool:
+    """更新消息状态"""
+    await db.execute(
+        update(Message)
+        .where(Message.id == message_id)
+        .values(status=status)
+    )
+    await db.commit()
+    return True
 
 async def delete_message(
         db: AsyncSession,

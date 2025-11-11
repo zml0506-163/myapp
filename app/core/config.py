@@ -33,6 +33,19 @@ class Settings(BaseModel):
     # 文件上传配置
     upload_dir: str = os.getenv("UPLOAD_DIR", "./uploads")
     max_upload_size: int = int(os.getenv("MAX_UPLOAD_SIZE", str(30 * 1024 * 1024)))  # 30MB
+    
+    # 文件存储策略配置
+    use_hash_sharding: bool = True  # 是否使用MD5分片
+    temp_file_cleanup_days: int = int(os.getenv("TEMP_FILE_CLEANUP_DAYS", "7"))  # 临时文件保留天数
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # 从环境变量读取布尔值配置（避免 Pydantic 字段定义中使用复杂逻辑）
+        self.use_hash_sharding = os.getenv("USE_HASH_SHARDING", "true").lower() == "true"
+        self.log_console = os.getenv("LOG_CONSOLE", "true").lower() == "true"
+        self.log_file = os.getenv("LOG_FILE", "true").lower() == "true"
+        self.log_color = os.getenv("LOG_COLOR", "false").lower() == "true"
+        self.use_redis_cache = os.getenv("USE_REDIS_CACHE", "false").lower() == "true"
 
     # CORS 配置
     allowed_origins: list[str] = [
@@ -42,14 +55,14 @@ class Settings(BaseModel):
         "*",
     ]
 
-    # 通义千问配置
+    # DashScope 配置
     dashscope_api_key: str = os.getenv("DASHSCOPE_API_KEY", "")
-    dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    dashscope_base_url: str = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 
     # 模型配置
-    qwen_max_model: str = "qwen-max"
-    qwen_long_model: str = "qwen-long"
-    qwen_vl_model: str = "qwen3-vl-plus"
+    qwen_max_model: str = os.getenv("QWEN_MAX_MODEL", "qwen-max")
+    qwen_long_model: str = os.getenv("QWEN_LONG_MODEL", "qwen-long")
+    qwen_vl_model: str = os.getenv("QWEN_VL_MODEL", "qwen-vl-plus")
 
     # ============================================
     # 检索配置
@@ -75,6 +88,22 @@ class Settings(BaseModel):
 
     # 检索倍数（检索数量 = 目标数量 * 倍数）
     search_multiplier: int = int(os.getenv("SEARCH_MULTIPLIER", "3"))
+
+    # ============================================
+    # 日志配置
+    # ============================================
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    log_dir: str = os.getenv("LOG_DIR", "./logs")  # 日志文件目录
+    log_console: bool = False  # 是否输出到控制台
+    log_file: bool = False  # 是否输出到文件
+    log_color: bool = False  # 控制台是否使用彩色输出
+
+    # ============================================
+    # Redis 缓存配置
+    # ============================================
+    use_redis_cache: bool = False  # 是否使用 Redis 缓存
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")  # Redis 连接地址
+    redis_cache_expire: int = int(os.getenv("REDIS_CACHE_EXPIRE", "3600"))  # Redis 缓存默认过期时间（秒）
 
 
     class Config:

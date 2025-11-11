@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from typing import Dict, Any, Optional
 
-from fastapi import FastAPI, Depends, Request, Query, HTTPException
+from fastapi import FastAPI, Depends, Request, Query, HTTPException, status as http_status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from pathlib import Path
@@ -22,12 +22,15 @@ from app.db import crud
 from app.tools.pubmed_client import pubmed_client
 from app.core.config import settings
 from app.tools.clinical_trials_client import async_search_trials
+from app.core.logger import logger
 
 app = FastAPI(
     title=settings.project_name,
     version=settings.version,
     openapi_url=f"{settings.api_prefix}/openapi.json"
 )
+
+logger.info(f"启动FastAPI应用: {settings.project_name} v{settings.version}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,7 +52,7 @@ app.include_router(api_router, prefix=settings.api_prefix)
 app.mount("/api/files", StaticFiles(directory=settings.pdf_dir), name="files")
 
 
-def build_msg(type_: str, content: dict | str, newline: bool = True, eventType: str = None, ids: str = None) -> str:
+def build_msg(type_: str, content: dict | str, newline: bool = True, eventType: str | None = None, ids: str | None = None) -> str:
     """
     type_: 'text', 'image', 'pdf', 'custom', 'link' 等
     content: 字符串或字典
@@ -66,10 +69,12 @@ def to_json(obj):
 # 启动建表
 @app.on_event("startup")
 async def on_startup():
+    logger.info("应用启动：初始化数据库和存储目录")
     pdf_dir = Path(settings.pdf_dir)
     pdf_dir.mkdir(parents=True, exist_ok=True)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    logger.info("应用启动完成")
 
 
 @app.post("/api/search")
@@ -217,7 +222,9 @@ async def search(request: Request, db: AsyncSession = Depends(get_db)):
 # 在应用关闭时优雅关闭线程池
 @app.on_event("shutdown")
 def shutdown_event():
+    logger.info("应用关闭：清理资源")
     executor.shutdown(wait=True)
+    logger.info("应用关闭完成")
 
 
 def format_paper(paper: Paper) -> Dict[str, Any]:
@@ -261,7 +268,7 @@ async def get_papers(
     )
 
     # 计算总页数
-    pages = (total + page_size - 1) // page_size
+    pages = (total + page_size - 1) // page_size if total else 0
 
     return {
         "items": [format_paper(p) for p in papers],
@@ -321,11 +328,11 @@ async def get_clinical_trials(
             "total": total,
             "page": page,
             "page_size": page_size,
-            "pages": (total + page_size - 1) // page_size  # 总页数
+            "pages": (total + page_size - 1) // page_size if total is not None else 0  # 总页数
         }
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"查询失败: {str(e)}"
         )
 

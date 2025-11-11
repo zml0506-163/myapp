@@ -5,7 +5,7 @@ app/services/llm_service.py
 import logging
 import os
 import base64
-from typing import AsyncGenerator, Optional, List, Dict
+from typing import AsyncGenerator, Optional, List, Dict, Any, Union
 from openai import AsyncOpenAI
 
 from app.core.config import settings
@@ -15,7 +15,7 @@ class MessageBuilder:
     """消息构建器 - 统一处理普通对话和文件上下文"""
 
     def __init__(self):
-        self.messages: List[Dict] = []
+        self.messages: List[Dict[str, Any]] = []
         self.file_ids: List[str] = []
         self.system_prompt: str = "你是一个专业的医疗问答助手。"
 
@@ -29,7 +29,7 @@ class MessageBuilder:
         self.file_ids.extend(file_ids)
         return self
 
-    def add_history(self, history: List[Dict]) -> 'MessageBuilder':
+    def add_history(self, history: List[Dict[str, Any]]) -> 'MessageBuilder':
         """添加历史对话"""
         self.messages.extend(history)
         return self
@@ -44,7 +44,7 @@ class MessageBuilder:
         self.messages.append({"role": "assistant", "content": content})
         return self
 
-    def build(self) -> List[Dict]:
+    def build(self) -> List[Dict[str, Any]]:
         """
         构建最终的消息列表
 
@@ -57,18 +57,18 @@ class MessageBuilder:
             ...
         ]
         """
-        result = []
+        result: List[Dict[str, Any]] = []
 
         # 1. 添加系统提示词
         result.append({"role": "system", "content": self.system_prompt})
 
-        # 2. 如果有文件ID，添加文件上下文
+        # 2. 添加历史消息（包括附件上下文）
+        result.extend(self.messages)
+
+        # 3. 如果有文件ID，添加文件上下文（在最后）
         if self.file_ids:
             file_context = ",".join([f"fileid://{fid}" for fid in self.file_ids])
             result.append({"role": "system", "content": file_context})
-
-        # 3. 添加历史消息和当前消息
-        result.extend(self.messages)
 
         return result
 
@@ -84,8 +84,8 @@ class LLMService:
 
     async def chat_stream(
             self,
-            messages: List[dict],
-            model: str = None,
+            messages: List[Dict[str, Any]],
+            model: Optional[str] = None,
             temperature: float = 0.7
     ) -> AsyncGenerator[str, None]:
         """
@@ -102,7 +102,7 @@ class LLMService:
         try:
             completion = await self.client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=messages,  # type: ignore
                 stream=True,
                 temperature=temperature,
             )
@@ -113,15 +113,31 @@ class LLMService:
 
         except Exception as e:
             logging.exception(e)
-            yield f"\n[错误] 模型调用失败: {str(e.code) if hasattr(e, 'code') else ''}\n"
+            error_msg = str(e)
+            
+            # 提取更友好的错误信息
+            if hasattr(e, 'response') and e.response is not None:  # type: ignore
+                try:
+                    error_data = e.response.json()  # type: ignore
+                    error_msg = error_data.get('error', {}).get('message', str(e))
+                except:
+                    pass
+            
+            # 判断是否是配额耗尽错误
+            if 'AllocationQuota' in str(e) or 'FreeTierOnly' in str(e):
+                error_msg = "模型免费额度已用完,请在阿里云控制台开通付费服务或关闭'仅使用免费额度'模式"
+            
+            yield f"\n❌ 模型调用失败: {error_msg}\n"
+            # 抛出异常，让上层捕获
+            raise
 
     async def chat_with_context(
             self,
             user_query: str,
-            history: List[Dict] = None,
-            file_ids: List[str] = None,
-            system_prompt: str = None,
-            model: str = None
+            history: Optional[List[Dict[str, Any]]] = None,
+            file_ids: Optional[List[str]] = None,
+            system_prompt: Optional[str] = None,
+            model: Optional[str] = None
     ) -> AsyncGenerator[str, None]:
         """
         统一的上下文对话接口
@@ -161,7 +177,7 @@ class LLMService:
             self,
             text: str,
             image_path: str,
-            history: List[dict] = None
+            history: Optional[List[Dict[str, Any]]] = None
     ) -> AsyncGenerator[str, None]:
         """
         基于图片的流式对话（使用 qwen3-vl-plus）
@@ -181,7 +197,7 @@ class LLMService:
             '.webp': 'image/webp',
         }.get(ext, 'image/png')
 
-        messages = [
+        messages: List[Dict[str, Any]] = [
             {"role": "system", "content": "你是一个专业的图像分析助手。"}
         ]
 
@@ -202,7 +218,7 @@ class LLMService:
         try:
             completion = await self.client.chat.completions.create(
                 model=settings.qwen_vl_model,
-                messages=messages,
+                messages=messages,  # type: ignore
                 stream=True,
             )
 
@@ -211,7 +227,22 @@ class LLMService:
                     yield chunk.choices[0].delta.content
 
         except Exception as e:
-            yield f"\n[错误] 视觉模型调用失败: {str(e)}\n"
+            error_msg = str(e)
+            
+            # 提取更友好的错误信息
+            if hasattr(e, 'response') and e.response is not None:  # type: ignore
+                try:
+                    error_data = e.response.json()  # type: ignore
+                    error_msg = error_data.get('error', {}).get('message', str(e))
+                except:
+                    pass
+            
+            # 判断是否是配额耗尽错误
+            if 'AllocationQuota' in str(e) or 'FreeTierOnly' in str(e):
+                error_msg = "VL模型免费额度已用完,请在阿里云控制台开通付费服务"
+            
+            yield f"\n❌ 视觉模型调用失败: {error_msg}\n"
+            raise
 
 
 # 全局实例

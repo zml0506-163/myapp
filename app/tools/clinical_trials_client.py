@@ -1,6 +1,7 @@
 import aiohttp
 import asyncio
 from typing import List, Optional, Literal, Tuple, Dict
+from aiohttp import ClientTimeout
 
 BASE_URL = "https://clinicaltrials.gov/api/v2/studies"
 
@@ -30,7 +31,7 @@ async def async_search_trials(
         params["pageToken"] = page_token
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(BASE_URL, params=params, timeout=30) as resp:
+        async with session.get(BASE_URL, params=params, timeout=ClientTimeout(total=30)) as resp:
             if resp.status != 200:
                 text = await resp.text()
                 raise Exception(f"HTTP {resp.status}: {text[:300]}")

@@ -35,7 +35,7 @@ class PubMedClient:
         self.max_concurrent = settings.max_concurrent_downloads
         self._semaphore = asyncio.Semaphore(self.max_concurrent)
 
-    async def esearch_pmids(self, query: str, retmax: int = None) -> List[str]:
+    async def esearch_pmids(self, query: str, retmax: Optional[int] = None) -> List[str]:
         """根据关键词搜索 PubMed，返回 PMID 列表"""
         if retmax is None:
             retmax = settings.max_pmids_to_fetch
@@ -183,7 +183,9 @@ class PubMedClient:
             pmid: str,
             url_type: str,
             executor: ThreadPoolExecutor,
-            progress_callback: Callable
+            progress_callback: Callable,
+            download_selector: Optional[str] = None,
+            page_wait_selector: Optional[str] = None
     ) -> Optional[Path]:
         """
         带超时的下载（支持重试）
@@ -194,24 +196,42 @@ class PubMedClient:
             try:
                 progress_callback(f"开始下载（尝试 {retry + 1}/{self.max_retries}）...", False)
 
+                # 根据 url_type 选择不同的下载函数和参数
                 if url_type == "tgz":
-                    download_func = download_pdf_from_tgz_sync
+                    pdf_path = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            executor,
+                            download_pdf_from_tgz_sync,
+                            pdf_link,
+                            f"{pmid}.pdf",
+                            progress_callback
+                        ),
+                        timeout=self.download_timeout
+                    )
                 elif url_type == "webview":
-                    download_func = download_pdf_from_webview
+                    pdf_path = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            executor,
+                            download_pdf_from_webview,
+                            pdf_link,
+                            pmid,
+                            download_selector,
+                            page_wait_selector,
+                            progress_callback
+                        ),
+                        timeout=self.download_timeout
+                    )
                 else:
-                    download_func = download_pdf_sync
-
-                # 使用 wait_for 设置超时
-                pdf_path = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        executor,
-                        download_func,
-                        pdf_link,
-                        f"{pmid}.pdf",
-                        progress_callback
-                    ),
-                    timeout=self.download_timeout
-                )
+                    pdf_path = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            executor,
+                            download_pdf_sync,
+                            pdf_link,
+                            f"{pmid}.pdf",
+                            progress_callback
+                        ),
+                        timeout=self.download_timeout
+                    )
 
                 if pdf_path:
                     progress_callback("下载成功", False)
@@ -278,6 +298,8 @@ class PubMedClient:
 
             for link in links:
                 full_text_link = link.get("href")
+                if not full_text_link or not isinstance(full_text_link, str):
+                    continue
                 publisher_url = urljoin(pubmed_url, full_text_link)
 
                 # 选择解析规则
@@ -305,7 +327,9 @@ class PubMedClient:
                     pmid,
                     url_type,
                     executor,
-                    progress_callback
+                    progress_callback,
+                    download_selector,
+                    page_wait_selector
                 )
 
                 if pdf_path:

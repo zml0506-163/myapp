@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 
 # ========== 出版商规则函数 ==========
 
-def parse_wiley(publisher_url: str, html: str) -> tuple[str, str, str, str] | None:
+def parse_wiley(publisher_url: str, html: str) -> tuple[str, str, str | None, str | None] | None:
     """规则1: Wiley 出版社，直接拼接 pdfdirect 链接"""
     # 例: https://onlinelibrary.wiley.com/doi/10.1111/jcmm.70836
     #     https://onlinelibrary.wiley.com/doi/epdf/10.1111/jcmm.70836
@@ -19,7 +19,7 @@ def parse_wiley(publisher_url: str, html: str) -> tuple[str, str, str, str] | No
     return None
 
 
-def parse_bmj(publisher_url: str, html: str) -> tuple[str, str, str, str] | None:
+def parse_bmj(publisher_url: str, html: str) -> tuple[str, str, str | None, str | None] | None:
     """解析 BMJ (jitc.bmj.com) 出版商页面，拼接 PDF 链接"""
     try:
         # 1. 从 publisher_url 提取 PMID
@@ -61,31 +61,36 @@ def parse_bmj(publisher_url: str, html: str) -> tuple[str, str, str, str] | None
         return None
 
 
-def parse_default(publisher_url: str, html: str) -> tuple[str, str, str, str] | None:
+def parse_default(publisher_url: str, html: str) -> tuple[str, str, str | None, str | None] | None:
     """规则3: 默认逻辑，用 BeautifulSoup 找 <a> 标签中包含 pdf 的链接"""
     soup = BeautifulSoup(html, "html.parser")
     meta_tag = soup.find('meta', {'name': 'citation_pdf_url'})
     # 提取 content 属性的值（即 PDF 链接）
     if meta_tag:
         pdf_url = meta_tag.get('content')
-        return pdf_url
+        if pdf_url and isinstance(pdf_url, str):
+            return pdf_url, "pdf", None, None
     for a in soup.find_all("a", href=True):
-        if "pdf" in a["href"].lower() or "pdf" in a.text.lower():
-            return urljoin(publisher_url, a["href"])
+        href = a.get("href")
+        if href and isinstance(href, str):
+            if "pdf" in href.lower() or "pdf" in a.text.lower():
+                return urljoin(publisher_url, href), "pdf", None, None
     return None
 
 
-def parse_custom_example(publisher_url: str, html: str) -> tuple[str, str, str, str] | None:
+def parse_custom_example(publisher_url: str, html: str) -> tuple[str, str, str | None, str | None] | None:
     """规则2: 某些出版商，PDF链接在 <button> 或 <p> 标签里"""
     soup = BeautifulSoup(html, "html.parser")
     # 举例：查找 data-pdf 属性的按钮
     btn = soup.find("button", {"data-pdf": True})
     if btn:
-        return urljoin(publisher_url, btn["data-pdf"])
+        data_pdf = btn.get("data-pdf")
+        if data_pdf and isinstance(data_pdf, str):
+            return urljoin(publisher_url, data_pdf), "pdf", None, None
     return None
 
 
-def parse_skip(publisher_url: str, html: str) -> tuple[str, str, str, str] | None:
+def parse_skip(publisher_url: str, html: str) -> tuple[str, str, str | None, str | None] | None:
     """规则4: 无法处理，直接返回 None"""
     return None
 
@@ -98,7 +103,7 @@ HEADERS = {
 }
 
 
-def parse_cell(publisher_url: str, html: str) -> tuple[str, str, str, str] | None:
+def parse_cell(publisher_url: str, html: str) -> tuple[str, str, str | None, str | None] | None:
     # 创建配置对象
     co = ChromiumOptions()
     # 设置不加载图片、静音
@@ -121,7 +126,7 @@ def parse_cell(publisher_url: str, html: str) -> tuple[str, str, str, str] | Non
     return None
 
 
-def parse_elsevier(publisher_url: str, html: str) -> tuple[str, str, str, str] | None:
+def parse_elsevier(publisher_url: str, html: str) -> tuple[str, str, str | None, str | None] | None:
     # https://linkinghub.elsevier.com/retrieve/pii/S2666-3791(25)00423-9
     # https://www.cell.com/cell-reports-medicine/fulltext/S2666-3791(25)00423-9
     new_publisher_url = publisher_url.replace("https://linkinghub.elsevier.com/retrieve/pii/", "https://www.cell.com/cell-reports-medicine/fulltext/")
@@ -141,7 +146,15 @@ PUBLISHER_RULES = {
 DEFAULT_RULE = parse_default
 
 
-def get_pdf_path_from_pmcid(pmcid: str):
+def get_pdf_path_from_pmcid(pmcid: str) -> Optional[str]:
+    """从 PMCID 获取 PDF 路径
+    
+    Args:
+        pmcid: PubMed Central ID
+        
+    Returns:
+        PDF 或 TGZ 文件的 URL 字符串，如果未找到则返回 None
+    """
     # 1. 用 PMCID 查询 oa.fcgi
     oa_url = f"https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id={pmcid}"
     response = requests.get(oa_url)
@@ -151,12 +164,20 @@ def get_pdf_path_from_pmcid(pmcid: str):
     # 优先直接 PDF 链接
     pdf_link = soup.find("link", {"format": "pdf"})
     if pdf_link:
-        pdf_url = pdf_link["href"]
-        return pdf_url
+        pdf_url = pdf_link.get("href")
+        # 确保返回字符串类型
+        if isinstance(pdf_url, str):
+            return pdf_url
+        elif isinstance(pdf_url, list) and len(pdf_url) > 0:
+            return str(pdf_url[0])
 
     # 其次 tgz 包
     tgz_link = soup.find("link", {"format": "tgz"})
     if tgz_link:
-        tgz_url = tgz_link["href"]
-        return tgz_url
+        tgz_url = tgz_link.get("href")
+        # 确保返回字符串类型
+        if isinstance(tgz_url, str):
+            return tgz_url
+        elif isinstance(tgz_url, list) and len(tgz_url) > 0:
+            return str(tgz_url[0])
     return None

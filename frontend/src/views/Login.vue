@@ -3,7 +3,7 @@
       <el-card class="login-card">
         <template #header>
           <div class="card-header">
-            <h2>AI 聊天助手</h2>
+            <h2>PubMed & 多来源检索</h2>
             <p>登录到您的账户</p>
           </div>
         </template>

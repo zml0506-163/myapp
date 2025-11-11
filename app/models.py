@@ -14,13 +14,13 @@ class Paper(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     pmid: Mapped[str | None] = mapped_column(String(32), index=True, unique=False, nullable=True)
-    pmcid: Mapped[str] = mapped_column(String(32), index=True, unique=False)  # 例如 "PMC1234567"
+    pmcid: Mapped[str | None] = mapped_column(String(32), index=True, unique=False, nullable=True)  # 例如 "PMC1234567"
     title: Mapped[str] = mapped_column(Text)
     source_type: Mapped[str] = mapped_column(String(64), index=True)
     abstract: Mapped[str | None] = mapped_column(Text, nullable=True)
     pub_date: Mapped[str | None] = mapped_column(String(50), nullable=True)
     authors: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    pdf_path: Mapped[str] = mapped_column(String(1024))  # 本地存储路径（相对/绝对）
+    pdf_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)  # 本地存储路径（相对/绝对）
     source_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)  # 文章网页（可选）
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -75,6 +75,13 @@ class MessageType(str, enum.Enum):
     SYSTEM = "system"
 
 
+class MessageStatus(str, enum.Enum):
+    """消息状态"""
+    GENERATING = "generating"  # 生成中
+    COMPLETED = "completed"    # 已完成
+    FAILED = "failed"          # 失败
+
+
 class User(Base):
     """用户表"""
     __tablename__ = "users"
@@ -108,6 +115,8 @@ class Message(Base):
     conversation_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     message_type: Mapped[MessageType] = mapped_column(Enum(MessageType), nullable=False)
+    status: Mapped[MessageStatus] = mapped_column(Enum(MessageStatus), nullable=False, default=MessageStatus.COMPLETED, server_default='completed')
+    metadata_json: Mapped[str | None] = mapped_column(Text)  # JSON格式的元数据
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

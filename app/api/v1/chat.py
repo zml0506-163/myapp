@@ -10,15 +10,19 @@ from typing import List, Dict, Any
 from pydantic import BaseModel
 
 from app.db.database import get_db_session
-from app.models import User, MessageType
+from app.models import User, MessageType, MessageStatus
 from app.api.deps import get_current_active_user
 from app.services.llm_service import llm_service
 from app.services.workflow_service import workflow_service
+from app.services.stream_service import background_generate_task, stream_events
+from app.services.smart_qa_service import smart_qa_service
 from app.crud import message as crud_message, conversation as crud_conversation
-from app.schemas.message import MessageCreateSchema
+from app.schemas.message import MessageCreateSchema, AttachmentBaseSchema
 from app.schemas.conversation import ConversationUpdateSchema
+from app.core.logger import get_logger
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 
 class ChatRequest(BaseModel):
@@ -67,7 +71,7 @@ AI：{ai_response[:200]}...
         return '是' in response or 'yes' in response
 
     except Exception as e:
-        print(f"判断对话类型失败: {e}")
+        logger.warning(f"判断对话类型失败: {e}")
         return len(user_query) > 10
 
 
@@ -106,7 +110,7 @@ AI：{ai_response[:300]}...
         return title
 
     except Exception as e:
-        print(f"生成标题失败: {e}")
+        logger.error(f"生成标题失败: {e}")
         return "新对话"
 
 
@@ -115,7 +119,7 @@ async def chat_stream(
         request: ChatRequest,
         current_user: User = Depends(get_current_active_user)
 ):
-    """统一聊天流式接口"""
+    """统一聊天流式接口（启动后台任务+返回SSE流）"""
 
     # 验证对话归属
     async with get_db_session() as db:
@@ -135,6 +139,27 @@ async def chat_stream(
     if request.attachments and request.mode == "normal":
         actual_mode = "attachment"
 
+    # 如果是多源检索模式，检查是否可以使用历史上下文
+    if actual_mode == "multi_source":
+        # 获取历史消息
+        async with get_db_session() as db:
+            history_messages = await crud_message.get_messages_by_conversation(
+                db,
+                conversation_id=request.conversation_id,
+                user_id=current_user.id
+            ) or []
+        
+        # 判断是否需要重新检索
+        should_retrieve = await smart_qa_service.should_retrieve_new_papers(
+            request.content, 
+            history_messages
+        )
+        
+        if not should_retrieve:
+            # 使用历史上下文回答
+            logger.info("使用历史上下文回答，无需重新检索")
+            actual_mode = "smart_qa"
+
     # 保存用户消息
     async with get_db_session() as db:
         user_message_schema = MessageCreateSchema(
@@ -142,12 +167,12 @@ async def chat_stream(
             content=request.content,
             message_type=MessageType.USER,
             attachments=[
-                {
-                    'filename': att.get('filename', ''),
-                    'original_filename': att.get('original_filename', ''),
-                    'file_size': att.get('file_size', 0),
-                    'mime_type': att.get('mime_type')
-                }
+                AttachmentBaseSchema(
+                    filename=att.get('filename', ''),
+                    original_filename=att.get('original_filename', ''),
+                    file_size=att.get('file_size', 0),
+                    mime_type=att.get('mime_type')
+                )
                 for att in request.attachments
             ]
         )
@@ -156,171 +181,96 @@ async def chat_stream(
             message_schema=user_message_schema,
             user_id=current_user.id
         )
+        
+        # 创建 AI 消息（初始状态为 generating）
+        ai_message_schema = MessageCreateSchema(
+            conversation_id=request.conversation_id,
+            content="",  # 空内容
+            message_type=MessageType.ASSISTANT
+        )
+        ai_message = await crud_message.create_message(
+            db,
+            message_schema=ai_message_schema,
+            user_id=current_user.id,
+            status=MessageStatus.GENERATING,
+            metadata_json=json.dumps({
+                "mode": actual_mode,
+                "attachments": request.attachments
+            }, ensure_ascii=False) if request.attachments else None
+        )
+        
+        if not ai_message:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="创建消息失败"
+            )
+        
+        message_id = ai_message['id']
 
     # 检查是否需要自动重命名
     is_first_conversation = (conversation.title == "新对话")
-
-    async def event_generator():
-        """生成 SSE 事件流"""
-        try:
-            ai_content = ""
-
-            if actual_mode == "multi_source":
-                # === 模式1: 多源检索工作流 ===
-                async for output in workflow_service.execute_with_streaming(
-                        conversation_id=request.conversation_id,
-                        user_id=current_user.id,
-                        user_query=request.content,
-                        user_attachments=request.attachments,
-                        is_first_conversation=is_first_conversation
-                ):
-                    yield f"data: {json.dumps(output, ensure_ascii=False)}\n\n"
-
-            elif actual_mode == "attachment":
-                # === 模式2: 附件问答（统一处理） ===
-                if not request.attachments:
-                    yield f"data: {json.dumps({'type': 'error', 'content': '未提供附件'}, ensure_ascii=False)}\n\n"
-                    return
-
-                # 处理附件
-                from app.services.file_service import file_service
-                file_ids, only_images = await file_service.process_attachments(request.attachments)
-
-                if not file_ids:
-                    yield f"data: {json.dumps({'type': 'error', 'content': '附件处理失败'}, ensure_ascii=False)}\n\n"
-                    return
-
-                # 如果只有一张图片，使用VL模型
-                if only_images and len(file_ids) == 1:
-                    image_att = request.attachments[0]
-                    async for chunk in llm_service.chat_with_image_stream(
-                            text=request.content,
-                            image_path=image_att.get('file_path', '')
-                    ):
-                        ai_content += chunk
-                        yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
-                else:
-                    # 使用统一接口（支持多文件）
-                    async for chunk in llm_service.chat_with_context(
-                            user_query=request.content,
-                            file_ids=file_ids,
-                            system_prompt="你是一个专业的文档分析助手。请仔细阅读文件并基于内容回答。"
-                    ):
-                        ai_content += chunk
-                        yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
-
-                # 保存 AI 消息
-                async with get_db_session() as db:
-                    ai_message_schema = MessageCreateSchema(
-                        conversation_id=request.conversation_id,
-                        content=ai_content,
-                        message_type=MessageType.ASSISTANT
-                    )
-                    ai_message = await crud_message.create_message(
-                        db,
-                        message_schema=ai_message_schema,
-                        user_id=current_user.id
-                    )
-
-                    yield f"data: {json.dumps({'type': 'done', 'message_id': ai_message['id']}, ensure_ascii=False)}\n\n"
-
-            else:  # normal mode
-                # === 模式3: 普通问答（使用统一接口） ===
-                async with get_db_session() as db:
-                    from sqlalchemy import select
-                    from app.models import Message
-
-                    result = await db.execute(
-                        select(Message)
-                        .where(Message.conversation_id == request.conversation_id)
-                        .order_by(Message.created_at.desc())
-                        .limit(5)
-                    )
-                    history_messages = result.scalars().all()
-
-                # 构建历史对话
-                history = []
-                for msg in reversed(list(history_messages)):
-                    history.append({
-                        "role": "user" if msg.message_type == MessageType.USER else "assistant",
-                        "content": msg.content
-                    })
-
-                # 使用统一接口
-                async for chunk in llm_service.chat_with_context(
-                        user_query=request.content,
-                        history=history,
-                        system_prompt="你是一个专业的医疗问答助手。"
-                ):
-                    ai_content += chunk
-                    yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
-
-                # 保存 AI 消息
-                async with get_db_session() as db:
-                    ai_message_schema = MessageCreateSchema(
-                        conversation_id=request.conversation_id,
-                        content=ai_content,
-                        message_type=MessageType.ASSISTANT
-                    )
-                    ai_message = await crud_message.create_message(
-                        db,
-                        message_schema=ai_message_schema,
-                        user_id=current_user.id
-                    )
-
-                    yield f"data: {json.dumps({'type': 'done', 'message_id': ai_message['id']}, ensure_ascii=False)}\n\n"
-
-            # === 智能重命名逻辑 ===
-            if is_first_conversation and ai_content and actual_mode != "multi_source":
-                try:
-                    should_rename = await should_generate_title(request.content, ai_content)
-
-                    if should_rename:
-                        new_title = await generate_conversation_title(request.content, ai_content)
-
-                        async with get_db_session() as db:
-                            await crud_conversation.update_conversation(
-                                db,
-                                conversation_id=request.conversation_id,
-                                conversation_schema=ConversationUpdateSchema(title=new_title),
-                                user_id=current_user.id
-                            )
-
-                        yield f"data: {json.dumps({{'type': 'title_updated', 'conversation_id': request.conversation_id, 'title': new_title}}, ensure_ascii=False)}\n\n"
-                    else:
-                        print(f"检测到寒暄对话，保持标题为'新对话'")
-
-                except Exception as e:
-                    print(f"自动重命名失败: {e}")
-
-        except asyncio.CancelledError:
-            if ai_content and actual_mode != "multi_source":
-                async with get_db_session() as db:
-                    ai_message_schema = MessageCreateSchema(
-                        conversation_id=request.conversation_id,
-                        content=ai_content + "\n\n[回答已中断]",
-                        message_type=MessageType.ASSISTANT
-                    )
-                    await crud_message.create_message(
-                        db,
-                        message_schema=ai_message_schema,
-                        user_id=current_user.id
-                    )
-            raise
-
-        except Exception as e:
-            import traceback
-            error_detail = traceback.format_exc()
-            print(f"Chat Error: {error_detail}")
-            yield f"data: {json.dumps({'type': 'error', 'content': f'❌ 错误: {str(e)}'}, ensure_ascii=False)}\n\n"
-
+    
+    # 启动后台生成任务
+    asyncio.create_task(
+        background_generate_task(
+            message_id=message_id,
+            conversation_id=request.conversation_id,
+            user_id=current_user.id,
+            user_query=request.content,
+            mode=actual_mode,
+            attachments=request.attachments,
+            is_first_conversation=is_first_conversation
+        )
+    )
+    
+    # 返回 SSE 流
     return StreamingResponse(
-        event_generator(),
+        stream_events(message_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+@router.get("/chat/stream/continue/{message_id}")
+async def continue_stream(
+        message_id: int,
+        current_user: User = Depends(get_current_active_user)
+):
+    """断线重连SSE接口"""
+    
+    # 验证消息归属
+    async with get_db_session() as db:
+        message = await crud_message.get_message_by_id(db, message_id)
+        if not message:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="消息不存在"
+            )
+        
+        # 验证对话归属
+        conversation = await crud_conversation.get_conversation_by_id(
+            db,
+            conversation_id=message.conversation_id,
+            user_id=current_user.id
+        )
+        if not conversation:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="无权访问该消息"
+            )
+    
+    # 返回 SSE 流（使用同一个生成器）
+    return StreamingResponse(
+        stream_events(message_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
         }
     )
 

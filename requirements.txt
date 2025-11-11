@@ -1,35 +1,73 @@
-fastapi
-uvicorn[standard]
-sqlalchemy[asyncio]
-aiomysql
-aiosqlite
-httpx
-aiohttp
-beautifulsoup4
-lxml
-pydantic
-pydantic[email]
-pydantic-settings
-python-dotenv
-requests
-jinja2
-browser-cookie3
-opencv-python
-numpy
-pytest-playwright
-alembic
-python-jose[cryptography]
-passlib[bcrypt]==1.7.4
-bcrypt==4.1.2
-python-multipart
-asyncpg
-metapub
-DrissionPage
+# Web Framework
+fastapi==0.120.4
+uvicorn[standard]==0.35.0
+starlette==0.49.1
 
-# LLM 相关
-openai>=1.0.0
-langgraph>=0.2.0
-langchain>=0.3.0
-langchain-openai>=0.2.0
-langchain-core>=0.3.0
+# Database
+sqlalchemy[asyncio]==2.0.44
+aiomysql==0.3.2
+aiosqlite==0.21.0
+asyncpg==0.30.0
+alembic==1.17.1
+
+# HTTP Clients
+httpx==0.28.1
+aiohttp==3.13.2
+requests==2.32.5
+
+# HTML/XML Parsing
+beautifulsoup4==4.14.2
+lxml==6.0.1
+cssselect==1.3.0
+
+# Data Validation
+pydantic==2.12.3
+pydantic[email]==2.12.3
+pydantic-settings==2.11.0
+pydantic_core==2.41.4
+python-dotenv==1.1.1
+jinja2==3.1.6
+browser-cookie3==0.20.1
+DrissionPage==4.1.1.2
+playwright==1.55.0
+pytest-playwright==0.7.1
+selenium==4.35.0
+
+# Image Processing
+opencv-python==4.12.0.88
+numpy==2.2.6
 Pillow==12.0.0
+
+# Testing
+pytest==8.4.2
+
+# Security & Auth
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
+python-multipart==0.0.20
+cryptography==46.0.3
+
+# Literature Search
+metapub==0.6.4
+eutils==0.6.0
+
+# Cache
+redis==5.0.0
+
+# LLM
+openai==2.7.0
+langgraph==1.0.2
+langchain==1.0.3
+langchain-openai==1.0.2
+langchain-core==1.0.3
+langsmith==0.4.40
+tiktoken==0.12.0
+
+# Utils
+python-slugify==8.0.4
+tenacity==9.1.2
+coloredlogs==15.0.1
+loguru==0.7.3
+tqdm==4.67.1
+setuptools<81

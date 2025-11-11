@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
@@ -18,23 +20,24 @@ async def get_current_user(
     try:
         payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
         # 从payload提取字段
-        user_id: str = payload.get("sub")
-        username: str = payload.get("username")
-        email: str = payload.get("email")
-        is_superuser: bool = payload.get("is_superuser")
-        is_active: bool = payload.get("is_active")
+        user_id: Optional[str] = payload.get("sub")
+        username: Optional[str] = payload.get("username")
+        email: Optional[str] = payload.get("email")
+        is_superuser: Optional[bool] = payload.get("is_superuser")
+        is_active: Optional[bool] = payload.get("is_active")
 
         # 校验必要字段是否存在
         if not all([user_id, username, email, is_superuser is not None, is_active is not None]):
             raise credentials_exception
 
         # 返回用户信息（可根据需要返回User对象或TokenUser）
+        # 类型断言：经过上面的校验，这些值不会是None
         return UserResponseSchema(
-            id=int(user_id),
-            username=username,
-            email=email,
-            is_superuser=is_superuser,
-            is_active=is_active
+            id=int(user_id),  # type: ignore
+            username=username,  # type: ignore
+            email=email,  # type: ignore
+            is_superuser=is_superuser,  # type: ignore
+            is_active=is_active  # type: ignore
         )
     except JWTError:
         raise credentials_exception

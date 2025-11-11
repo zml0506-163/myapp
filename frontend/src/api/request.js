@@ -30,21 +30,32 @@ service.interceptors.request.use(
 // 响应拦截器
 service.interceptors.response.use(
   response => {
+    // 如果是blob类型，直接返回数据（用于文件下载）
+    if (response.config.responseType === 'blob') {
+      return response.data
+    }
     return response.data
   },
   error => {
     console.error('Response error:', error)
     
-    const { response } = error
+    const { response, config } = error
     
     if (response) {
       const { status, data } = response
       
       switch (status) {
         case 401:
-          ElMessage.error('登录已过期，请重新登录')
-          removeToken()
-          router.push('/login')
+          // 区分登录接口和其他接口的401错误
+          if (config.url && config.url.includes('/auth/login')) {
+            // 登录接口的401，显示后端返回的具体错误信息
+            ElMessage.error(data?.detail || '登录验证失败，请输入正确的账号密码')
+          } else {
+            // 其他接口的401，说明token过期
+            ElMessage.error('登录已过期，请重新登录')
+            removeToken()
+            router.push('/login')
+          }
           break
         case 403:
           ElMessage.error('没有权限访问')
