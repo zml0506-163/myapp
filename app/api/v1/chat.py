@@ -159,6 +159,10 @@ async def chat_stream(
             # 使用历史上下文回答
             logger.info("使用历史上下文回答，无需重新检索")
             actual_mode = "smart_qa"
+        else:
+            # 需要重新检索，保持多源检索模式
+            logger.info("需要重新检索，使用多源检索模式")
+            actual_mode = "multi_source"
 
     # 保存用户消息
     async with get_db_session() as db:

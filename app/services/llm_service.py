@@ -62,13 +62,13 @@ class MessageBuilder:
         # 1. 添加系统提示词
         result.append({"role": "system", "content": self.system_prompt})
 
-        # 2. 添加历史消息（包括附件上下文）
-        result.extend(self.messages)
-
-        # 3. 如果有文件ID，添加文件上下文（在最后）
+        # 2. 如果有文件ID，添加文件上下文（在系统提示词之后，用户消息之前）
         if self.file_ids:
             file_context = ",".join([f"fileid://{fid}" for fid in self.file_ids])
             result.append({"role": "system", "content": file_context})
+
+        # 3. 添加历史消息
+        result.extend(self.messages)
 
         return result
 

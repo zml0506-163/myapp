@@ -59,6 +59,7 @@ class WorkflowService:
         """执行工作流并流式输出"""
 
         execution_id = await self._create_execution(conversation_id, user_id)
+        logger.info(f"开始执行工作流，对话ID: {conversation_id}, 消息ID: {message_id}, 是否新对话: {is_first_conversation}")
 
         state: WorkflowState = {
             'conversation_id': conversation_id,
@@ -109,9 +110,11 @@ class WorkflowService:
             # 保存结果
             await self._save_result(state, execution_id, message_id)
             await self._update_execution(execution_id, 'completed')
+            logger.info(f"工作流执行完成，执行ID: {execution_id}")
 
             # 生成标题
             if is_first_conversation:
+                logger.info(f"开始生成对话标题，对话ID: {conversation_id}")
                 await self._generate_title(state, conversation_id, user_id)
 
             # 最终完成信号
@@ -848,7 +851,9 @@ class WorkflowService:
                         user_id=user_id
                     )
 
-                logger.info(f"对话已自动重命名为「{new_title}」")
+                logger.info(f"对话 {conversation_id} 已自动重命名为「{new_title}」")
+            else:
+                logger.warning(f"生成的标题无效，标题: {new_title}")
 
         except Exception as e:
             logger.error(f"生成标题失败: {e}")

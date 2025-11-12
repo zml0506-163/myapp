@@ -867,7 +867,6 @@ const reconnectStream = async (messageId) => {
             } else if (data.type === 'error') {
               ElMessage.error(data.content)
               isAITyping.value = false
-              isSending.value = false
               workflowDone.value = true
               currentReader.value = null
             } else {
@@ -909,8 +908,12 @@ const handleSend = async () => {
   let mode = 'normal'
   if (enableMultiSource.value) {
     mode = 'multi_source'
+    console.log('[DEBUG] 启用多源检索模式')
   } else if (conversationAttachments.value.length > 0) {
     mode = 'attachment'
+    console.log('[DEBUG] 启用附件模式')
+  } else {
+    console.log('[DEBUG] 启用普通模式')
   }
 
   // 清空输入
@@ -929,6 +932,7 @@ const handleSend = async () => {
   workflowSections.value = []
   simpleResponse.value = ''
   isWorkflowMode.value = (mode === 'multi_source')
+  console.log('[DEBUG] 工作流模式状态:', isWorkflowMode.value)
   
   // 如果是附件模式，创建附件处理日志区块
   if (mode === 'attachment') {
@@ -960,6 +964,13 @@ const handleSend = async () => {
     // 调用流式 API
     const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
     const token = localStorage.getItem('chat_token')
+    
+    console.log('[DEBUG] 发送请求到API:', {
+      conversation_id: chatStore.currentConversationId,
+      content: content,
+      mode: mode,
+      attachments: conversationAttachments.value
+    })
     
     const response = await fetch(`${baseURL}/chat/stream`, {
       method: 'POST',
@@ -996,6 +1007,7 @@ const handleSend = async () => {
         if (line.startsWith('data: ')) {
           try {
             const data = JSON.parse(line.slice(6))
+            console.log('[DEBUG] 接收到SSE事件:', data.type, data)
             
             // === 工作流模式的事件处理 ===
             if (data.type === 'section_start') {
@@ -1009,6 +1021,7 @@ const handleSend = async () => {
                 summary: ''
               }
               workflowSections.value = [...workflowSections.value, currentSection]
+              console.log('[DEBUG] 开始新区块:', data.step)
               
             } else if (data.type === 'section_end') {
               if (currentSection) {
@@ -1018,7 +1031,7 @@ const handleSend = async () => {
                   const section = workflowSections.value[idx]
 
                   // 调试日志
-                  console.log(`[DEBUG] Section ${data.step} ending:`, {
+                  console.log(`[DEBUG] 区块结束 ${data.step}:`, {
                     logs_count: section.logs.length,
                     results_count: section.results.length,
                     collapsed: section.collapsed
@@ -1031,6 +1044,7 @@ const handleSend = async () => {
                 }
               }
               currentSection = null
+              console.log('[DEBUG] 结束当前区块')
               
             } else if (data.type === 'log') {
               // 查找当前活跃区块
@@ -1081,6 +1095,7 @@ const handleSend = async () => {
                   }
                 }
               }
+              console.log('[DEBUG] 处理日志事件:', data.source, data.content.substring(0, 50))
             } else if (data.type === 'result') {
               // 查找目标区块
               let targetSection = currentSection
@@ -1134,6 +1149,7 @@ const handleSend = async () => {
                     ...section,
                     ...updates
                   }
+                  console.log('[DEBUG] 更新结果内容，摘要:', data.summary)
                 }
               }
             } else if (data.type === 'token') {
@@ -1170,12 +1186,14 @@ const handleSend = async () => {
                 // 纯普通模式：直接追加到 simpleResponse
                 simpleResponse.value += data.content
               }
+              console.log('[DEBUG] 处理token事件，内容长度:', data.content.length)
               
             } else if (data.type === 'done') {
               workflowDone.value = true
               isAITyping.value = false
               currentReader.value = null
               await chatStore.fetchMessages(chatStore.currentConversationId)
+              console.log('[DEBUG] 生成完成')
               
             } else if (data.type === 'title_updated') {
               const conversationId = data.conversation_id
@@ -1187,12 +1205,14 @@ const handleSend = async () => {
               }
               
               ElMessage.success(`对话已自动重命名为「${newTitle}」`)
+              console.log('[DEBUG] 对话标题更新:', newTitle)
               
             } else if (data.type === 'error') {
               ElMessage.error(data.content)
               isAITyping.value = false
               workflowDone.value = true
               currentReader.value = null
+              console.log('[DEBUG] 发生错误:', data.content)
             } else {
               // 忽略未知类型，避免显示调试信息
               console.warn('未知的 SSE 事件类型:', data.type, data)
@@ -2100,7 +2120,16 @@ const handleDownloadAttachment = async (attachment) => {
 .multi-source-switch {
   display: flex;
   align-items: center;
-  margin-left: 8px;
+  margin-left: 10px;
+}
+
+.multi-source-switch :deep(.el-switch__label) {
+  color: #606266;
+  font-weight: normal;
+}
+
+.multi-source-switch :deep(.el-switch__label.is-active) {
+  color: #409eff;
 }
 
 .send-btn {

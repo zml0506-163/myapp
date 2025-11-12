@@ -202,6 +202,7 @@ async def background_generate_task(
 
         if mode == "multi_source":
             # 多源检索工作流
+            logger.info(f"开始执行多源检索工作流，消息ID: {message_id}")
             async for output in workflow_service.execute_with_streaming(
                 conversation_id=conversation_id,
                 user_id=user_id,
@@ -281,8 +282,47 @@ async def background_generate_task(
                 })
                 await set_cache(f"{cache_key}:events", json.dumps(events, ensure_ascii=False))
 
-        # 生成完成
+        # 🔥 统一的自动重命名逻辑（所有模式都支持）
+        # 对于多源检索模式，我们需要从工作流结果中提取完整响应
+        if mode == "multi_source":
+            # 从工作流结果中提取完整响应内容
+            try:
+                from app.models import Message
+                async with get_db_session() as db:
+                    result = await db.execute(
+                        select(Message).where(Message.id == message_id)
+                    )
+                    message = result.scalar_one_or_none()
+                    if message and message.content:
+                        full_response = message.content
+                        logger.info(f"从数据库获取多源检索完整内容，长度: {len(full_response)}")
+            except Exception as e:
+                logger.error(f"获取多源检索完整内容失败: {e}")
+        
+        # 在发送done事件之前执行自动重命名
+        logger.info(f"准备执行自动重命名，是否新对话: {is_first_conversation}，响应内容长度: {len(full_response)}")
+        if is_first_conversation and full_response.strip():
+            await auto_rename_conversation(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                user_query=user_query,
+                ai_response=full_response,
+                events=events
+            )
+            # 更新缓存（包含标题更新事件）
+            await set_cache(f"{cache_key}:events", json.dumps(events, ensure_ascii=False))
+            
+            # 等待一小段时间确保缓存更新完成
+            await asyncio.sleep(0.1)
+
+        # 添加done事件到events列表中
+        events.append({'type': 'done'})
+        
+        # 更新缓存（包含done事件）
+        await set_cache(f"{cache_key}:events", json.dumps(events, ensure_ascii=False))
         await set_cache(f"{cache_key}:status", "completed")
+        
+        logger.info(f"消息 {message_id} 生成完成，模式: {mode}，是否新对话: {is_first_conversation}")
 
         # 保存到数据库（多源检索模式已在workflow_service中保存）
         if mode != "multi_source":
@@ -295,20 +335,6 @@ async def background_generate_task(
                     content=final_content,
                     status=MessageStatus.COMPLETED
                 )
-
-        # 🔥 统一的自动重命名逻辑（所有模式都支持）
-        if is_first_conversation and full_response.strip():
-            await auto_rename_conversation(
-                conversation_id=conversation_id,
-                user_id=user_id,
-                user_query=user_query,
-                ai_response=full_response,
-                events=events
-            )
-            # 更新缓存（包含标题更新事件）
-            await set_cache(f"{cache_key}:events", json.dumps(events, ensure_ascii=False))
-
-        logger.info(f"消息 {message_id} 生成完成")
 
         # 延迟清除缓存
         await asyncio.sleep(10)
