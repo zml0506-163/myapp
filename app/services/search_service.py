@@ -3,6 +3,8 @@
 app/services/search_service.py
 """
 import asyncio
+import logging
+
 from typing import List, Dict, Set, Optional
 from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy import select, or_, and_
@@ -18,6 +20,7 @@ from app.tools.pubmed_client import pubmed_client
 from app.tools.europepmc_client import search_europe_pmc
 from app.tools.clinical_trials_client import async_search_trials
 
+logger = logging.getLogger("search_service")
 
 class SearchProgress:
     """进度回调封装"""
@@ -37,6 +40,7 @@ class SearchProgress:
             }),
             self.loop
         )
+        logger.info(f"Progress callback: {message}")
 
 
 class SearchService:
@@ -44,6 +48,7 @@ class SearchService:
 
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=settings.max_concurrent_downloads)
+        self.logger = logging.getLogger("search_service")
 
     def _calculate_relevance(self, query: str, text: str) -> float:
         """
@@ -124,7 +129,7 @@ class SearchService:
             await progress_queue.put({
                 'type': 'log',
                 'source': 'pubmed',
-                'content': f'\n🔍 开始检索 PubMed 和 Europe PMC...\n',
+                'content': f'\n🔍 开始检索 PubMed 和 Europe PMC...\n\n',
                 'newline': True
             })
 
@@ -158,7 +163,7 @@ class SearchService:
         await progress_queue.put({
             'type': 'log',
             'source': 'dedup',
-            'content': f'🔄 去重后共 {len(all_papers)} 篇文献\n',
+            'content': f'\n🔄 去重后共 {len(all_papers)} 篇文献\n\n',
             'newline': True
         })
 
@@ -258,63 +263,76 @@ class SearchService:
             await progress_queue.put({
                 'type': 'log',
                 'source': 'pubmed',
-                'content': f'📥 找到 {len(pmids)} 个 PMID，准备下载 PDF...\n',
+                'content': f'📥 找到 {len(pmids)} 个 PMID，准备下载 PDF...\n\n',
                 'newline': True
             })
 
             # 获取元数据
             meta = await pubmed_client.efetch_metadata(pmids)
 
-            # 并发下载 PDF（使用 Semaphore 控制并发）
+            # 批量检查数据库中已存在的文献
             async with get_db_session() as db:
-                download_tasks = []
-
-                for pid in pmids:
-                    # 达到目标数量后停止
-                    if len(results) >= target_count:
-                        await progress_queue.put({
-                            'type': 'log',
-                            'source': 'pubmed',
-                            'content': f'✅ 已获取足够文献（{target_count} 篇），停止检索\n',
-                            'newline': True
-                        })
-                        break
-
-                    # 检查是否已存在
-                    result = await db.execute(
-                        select(Paper).where(
-                            Paper.pmid == pid,
-                            Paper.source_type == 'pubmed'
+                # 批量查询已存在的PMID
+                result = await db.execute(
+                    select(Paper).where(
+                        Paper.pmid.in_(pmids),
+                        Paper.source_type == 'pubmed'
+                    )
+                )
+                existing_papers = result.scalars().all()
+                existing_pmids = {p.pmid for p in existing_papers}
+                
+                # 添加已存在的文献到结果
+                for paper in existing_papers:
+                    results.append(self._paper_to_dict(paper))
+                
+                if existing_pmids:
+                    await progress_queue.put({
+                        'type': 'log',
+                        'source': 'pubmed',
+                        'content': f'  ✓ 找到 {len(existing_pmids)} 篇已缓存文献\n\n',
+                        'newline': True
+                    })
+                
+                # 过滤出需要下载的PMID
+                pmids_to_download = [pid for pid in pmids if pid not in existing_pmids]
+                
+                if not pmids_to_download:
+                    await progress_queue.put({
+                        'type': 'log',
+                        'source': 'pubmed',
+                        'content': '✅ 所有文献均已缓存\n\n',
+                        'newline': True
+                    })
+                else:
+                    # 限制下载数量
+                    max_to_download = min(len(pmids_to_download), target_count - len(results))
+                    pmids_to_download = pmids_to_download[:max_to_download]
+                    
+                    await progress_queue.put({
+                        'type': 'log',
+                        'source': 'pubmed',
+                        'content': f'  📥 准备下载 {len(pmids_to_download)} 篇新文献...\n\n',
+                        'newline': True
+                    })
+                    
+                    # 并发下载（批量处理）
+                    download_tasks = []
+                    for pid in pmids_to_download:
+                        task = self._download_and_save_paper(
+                            pid,
+                            meta.get(pid, {}),
+                            progress_queue
                         )
-                    )
-                    existing = result.scalar_one_or_none()
-
-                    if existing:
-                        results.append(self._paper_to_dict(existing))
-                        await progress_queue.put({
-                            'type': 'log',
-                            'source': 'pubmed',
-                            'content': f'  ✓ PMID {pid} 已存在缓存\n',
-                            'newline': True
-                        })
-                        continue
-
-                    # 创建下载任务
-                    task = self._download_and_save_paper(
-                        pid,
-                        meta.get(pid, {}),
-                        progress_queue
-                    )
-                    download_tasks.append(task)
-
-                # 等待所有下载任务完成
-                if download_tasks:
+                        download_tasks.append(task)
+                    
+                    # 等待所有下载任务完成
                     papers = await asyncio.gather(*download_tasks, return_exceptions=True)
-
+                    
                     for paper in papers:
                         if paper and not isinstance(paper, Exception):
                             results.append(paper)
-
+                            
                             # 达到目标数量后停止
                             if len(results) >= target_count:
                                 break
@@ -322,7 +340,7 @@ class SearchService:
             await progress_queue.put({
                 'type': 'log',
                 'source': 'pubmed',
-                'content': f'✅ PubMed 检索完成，成功获取 {len(results)} 篇文献\n',
+                'content': f'\n✅ PubMed 检索完成，成功获取 {len(results)} 篇文献\n\n',
                 'newline': True
             })
 
@@ -342,41 +360,56 @@ class SearchService:
             metadata: Dict,
             progress_queue: asyncio.Queue
     ) -> Optional[Dict]:
-        """下载并保存单篇文献"""
+        """下载并保存单篇文献（优化版本，减少日志输出）"""
         try:
-            await progress_queue.put({
-                'type': 'log',
-                'source': 'pubmed',
-                'content': f'  📄 处理 PMID {pmid}...',
-                'newline': False
-            })
-
-            # 创建进度回调
+            # 创建进度回调（静默模式）
             progress = SearchProgress(progress_queue, 'pubmed')
+
+            # 推送队列状态（用于前端表格 upsert）
+            await progress_queue.put({
+                'type': 'progress',
+                'entity': 'download',
+                'id': f'PMID:{pmid}',
+                'source': 'pubmed',
+                'status': 'queued',
+                'title': (metadata.get("title") or "(no title)"),
+                'pmid': pmid,
+                'pmcid': metadata.get("pmcid")
+            })
+            self.logger.info("progress queued pubmed id=%s title=%s", pmid, (metadata.get("title") or "(no title)"))
+
+            # 带 item 维度的日志回调（线程安全）
+            def item_log_callback(message: str, newline: bool = True):
+                asyncio.run_coroutine_threadsafe(
+                    progress_queue.put({
+                        'type': 'log',
+                        'source': 'pubmed',
+                        'item_id': f'PMID:{pmid}',
+                        'content': message,
+                        'newline': newline
+                    }),
+                    progress.loop
+                )
 
             # 使用优化的客户端下载（带超时和并发控制）
             pdf_path = await pubmed_client.download_pdf_with_limit(
                 pmid,
                 metadata.get("pmcid"),
                 self.executor,
-                progress.callback
+                item_log_callback  # 转发详细日志到前端（绑定 item_id）
             )
 
             if not pdf_path:
+                # 只在失败时输出简短日志
                 await progress_queue.put({
-                    'type': 'log',
+                    'type': 'progress',
+                    'entity': 'download',
+                    'id': f'PMID:{pmid}',
                     'source': 'pubmed',
-                    'content': ' ❌ 跳过\n',
-                    'newline': True
+                    'status': 'failed'
                 })
+                self.logger.info("progress failed pubmed id=%s", pmid)
                 return None
-
-            await progress_queue.put({
-                'type': 'log',
-                'source': 'pubmed',
-                'content': ' ✅\n',
-                'newline': True
-            })
 
             # 保存到数据库
             async with get_db_session() as db:
@@ -393,15 +426,158 @@ class SearchService:
                     source_url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
                 )
 
+                # 成功后输出简短日志
+                await progress_queue.put({
+                    'type': 'log',
+                    'source': 'pubmed',
+                    'content': f'  ✓ {pmid}\n',
+                    'newline': True
+                })
+
+                # 同步更新进度状态
+                await progress_queue.put({
+                    'type': 'progress',
+                    'entity': 'download',
+                    'id': f'PMID:{pmid}',
+                    'source': 'pubmed',
+                    'status': 'success',
+                    'pdf_path': str(pdf_path)
+                })
+                self.logger.info("progress success pubmed id=%s path=%s", pmid, str(pdf_path))
+
                 return self._paper_to_dict(paper)
 
         except Exception as e:
+            # 静默失败，不输出错误日志
             await progress_queue.put({
-                'type': 'log',
+                'type': 'progress',
+                'entity': 'download',
+                'id': f'PMID:{pmid}',
                 'source': 'pubmed',
-                'content': f' ❌ 错误: {str(e)}\n',
-                'newline': True
+                'status': 'failed'
             })
+            try:
+                self.logger.exception("exception during pubmed download id=%s", pmid)
+            except Exception:
+                pass
+            return None
+    
+    async def _download_europepmc_paper(
+            self,
+            record: Dict,
+            progress_queue: asyncio.Queue
+    ) -> Optional[Dict]:
+        """下载并保存Europe PMC文献（优化版本）"""
+        try:
+            pmid = record.get("pmid")
+            pmcid = record.get("pmcid")
+            title = record.get("title")
+
+            if not pmcid or not title:
+                return None
+
+            # 推送队列状态（用于前端表格 upsert）
+            await progress_queue.put({
+                'type': 'progress',
+                'entity': 'download',
+                'id': f'PMCID:{pmcid}',
+                'source': 'europepmc',
+                'status': 'queued',
+                'title': title,
+                'pmid': pmid,
+                'pmcid': pmcid
+            })
+            self.logger.info("progress queued europepmc pmcid=%s pmid=%s title=%s", pmcid, pmid, title)
+
+            # 下载 PDF
+            from pathlib import Path
+            import requests
+            
+            pdf_url = f"https://europepmc.org/articles/{pmcid}?pdf=render"
+            filename = f"europepmc_{pmcid}.pdf"
+            pdf_path = storage_helper.get_pdf_storage_path('europepmc', filename)
+            
+            loop = asyncio.get_running_loop()
+            
+            def download_pdf():
+                try:
+                    r = requests.get(pdf_url, timeout=settings.pdf_download_timeout)
+                    if r.status_code == 200 and "pdf" in r.headers.get("content-type", "").lower():
+                        pdf_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(pdf_path, "wb") as f:
+                            f.write(r.content)
+                        return True
+                except:
+                    pass
+                return False
+            
+            try:
+                download_success = await asyncio.wait_for(
+                    loop.run_in_executor(self.executor, download_pdf),
+                    timeout=settings.pdf_download_timeout
+                )
+            except asyncio.TimeoutError:
+                download_success = False
+
+            if not download_success:
+                await progress_queue.put({
+                    'type': 'progress',
+                    'entity': 'download',
+                    'id': f'PMCID:{pmcid}',
+                    'source': 'europepmc',
+                    'status': 'failed'
+                })
+                self.logger.info("progress failed europepmc pmcid=%s", pmcid)
+                return None
+
+            # 保存到数据库
+            async with get_db_session() as db:
+                paper = await upsert_paper(
+                    db,
+                    pmid=pmid,
+                    pmcid=pmcid,
+                    title=title,
+                    source_type='europepmc',
+                    abstract='',
+                    pub_date=record.get("pubYear"),
+                    authors=record.get("authorString"),
+                    pdf_path=str(pdf_path),
+                    source_url=f"https://europepmc.org/article/MED/{pmid}" if pmid else f"https://europepmc.org/articles/{pmcid}"
+                )
+
+                # 成功后输出简短日志
+                await progress_queue.put({
+                    'type': 'log',
+                    'source': 'europepmc',
+                    'content': f'  ✓ {pmcid}\n',
+                    'newline': True
+                })
+
+                await progress_queue.put({
+                    'type': 'progress',
+                    'entity': 'download',
+                    'id': f'PMCID:{pmcid}',
+                    'source': 'europepmc',
+                    'status': 'success',
+                    'pdf_path': str(pdf_path)
+                })
+                self.logger.info("progress success europepmc pmcid=%s path=%s", pmcid, str(pdf_path))
+
+                return self._paper_to_dict(paper)
+        
+        except Exception as e:
+            # 静默失败
+            await progress_queue.put({
+                'type': 'progress',
+                'entity': 'download',
+                'id': f'PMCID:{record.get("pmcid")}',
+                'source': 'europepmc',
+                'status': 'failed'
+            })
+            try:
+                self.logger.exception("exception during europepmc download pmcid=%s", record.get("pmcid"))
+            except Exception:
+                pass
             return None
 
     async def _fetch_europepmc_papers(
@@ -428,154 +604,91 @@ class SearchService:
             await progress_queue.put({
                 'type': 'log',
                 'source': 'europepmc',
-                'content': f'📥 找到 {len(records)} 条记录\n',
+                'content': f'📥 找到 {len(records)} 条记录\n\n',
                 'newline': True
             })
 
-            # 处理记录
+            # 过滤有PDF的记录
+            records_with_pdf = [r for r in records if r.get("hasPDF") == 'Y' and r.get("pmcid")]
+            
+            if not records_with_pdf:
+                await progress_queue.put({
+                    'type': 'log',
+                    'source': 'europepmc',
+                    'content': '⚠️ 没有可下载的PDF文献\n\n',
+                    'newline': True
+                })
+                return results
+            
+            # 批量检查数据库中已存在的文献
             async with get_db_session() as db:
-                for record in records:
-                    # 达到目标数量后停止
-                    if len(results) >= target_count:
-                        await progress_queue.put({
-                            'type': 'log',
-                            'source': 'europepmc',
-                            'content': f'✅ 已获取足够文献（{target_count} 篇），停止检索\n',
-                            'newline': True
-                        })
-                        break
-
-                    pmid = record.get("pmid")
-                    pmcid = record.get("pmcid")
-                    has_pdf = record.get("hasPDF")
-
-                    if has_pdf == 'N':
-                        continue
-
-                    # 检查是否已存在
-                    if pmid:
-                        result = await db.execute(
-                            select(Paper).where(
-                                Paper.pmid == pmid,
-                                Paper.source_type == 'europepmc'
-                            )
-                        )
-                    elif pmcid:
-                        result = await db.execute(
-                            select(Paper).where(
-                                Paper.pmcid == pmcid,
-                                Paper.source_type == 'europepmc'
-                            )
-                        )
-                    else:
-                        continue
-
-                    existing = result.scalar_one_or_none()
-
-                    if existing:
-                        results.append(self._paper_to_dict(existing))
-                        await progress_queue.put({
-                            'type': 'log',
-                            'source': 'europepmc',
-                            'content': f'  ✓ {pmcid or pmid} 已存在缓存\n',
-                            'newline': True
-                        })
-                        continue
-
-                    title = record.get("title")
-                    
-                    if not title:
-                        await progress_queue.put({
-                            'type': 'log',
-                            'source': 'europepmc',
-                            'content': f'  ⚠️ {pmcid or pmid} 缺少标题，跳过\n',
-                            'newline': True
-                        })
-                        continue
-                    
+                pmcids = [r.get("pmcid") for r in records_with_pdf if r.get("pmcid")]
+                
+                # 批量查询已存在的PMCID
+                result = await db.execute(
+                    select(Paper).where(
+                        Paper.pmcid.in_(pmcids),
+                        Paper.source_type == 'europepmc'
+                    )
+                )
+                existing_papers = result.scalars().all()
+                existing_pmcids = {p.pmcid for p in existing_papers}
+                
+                # 添加已存在的文献到结果
+                for paper in existing_papers:
+                    results.append(self._paper_to_dict(paper))
+                
+                if existing_pmcids:
                     await progress_queue.put({
                         'type': 'log',
                         'source': 'europepmc',
-                        'content': f'  📄 处理 {pmcid or pmid}...',
-                        'newline': False
-                    })
-
-                    # 下载 PDF
-                    from pathlib import Path
-                    import requests
-
-                    if not pmcid:
-                        await progress_queue.put({
-                            'type': 'log',
-                            'source': 'europepmc',
-                            'content': ' ⚠️ 无PMCID，无法下载PDF\n',
-                            'newline': True
-                        })
-                        continue
-                    
-                    pdf_url = f"https://europepmc.org/articles/{pmcid}?pdf=render"
-
-                    filename = f"europepmc_{pmcid or pmid}.pdf"
-                    pdf_path = storage_helper.get_pdf_storage_path('europepmc', filename)
-
-                    loop = asyncio.get_running_loop()
-
-                    def download_pdf():
-                        try:
-                            r = requests.get(pdf_url, timeout=settings.pdf_download_timeout)
-                            if r.status_code == 200 and "pdf" in r.headers.get("content-type", "").lower():
-                                pdf_path.parent.mkdir(parents=True, exist_ok=True)
-                                with open(pdf_path, "wb") as f:
-                                    f.write(r.content)
-                                return True
-                        except:
-                            pass
-                        return False
-
-                    try:
-                        download_success = await asyncio.wait_for(
-                            loop.run_in_executor(self.executor, download_pdf),
-                            timeout=settings.pdf_download_timeout
-                        )
-                    except asyncio.TimeoutError:
-                        download_success = False
-
-                    if not download_success:
-                        await progress_queue.put({
-                            'type': 'log',
-                            'source': 'europepmc',
-                            'content': ' ❌\n',
-                            'newline': True
-                        })
-                        continue
-
-                    await progress_queue.put({
-                        'type': 'log',
-                        'source': 'europepmc',
-                        'content': ' ✅\n',
+                        'content': f'  ✓ 找到 {len(existing_pmcids)} 篇已缓存文献\n\n',
                         'newline': True
                     })
-
-                    # 保存到数据库
-                    paper = await upsert_paper(
-                        db,
-                        pmid=pmid,
-                        pmcid=pmcid,
-                        title=title,
-                        source_type='europepmc',
-                        abstract='',
-                        pub_date=record.get("pubYear"),
-                        authors=record.get("authorString"),
-                        pdf_path=str(pdf_path),
-                        source_url=f"https://europepmc.org/article/MED/{pmid}" if pmid else f"https://europepmc.org/articles/{pmcid}"
-                    )
-
-                    results.append(self._paper_to_dict(paper))
+                
+                # 过滤出需要下载的记录
+                records_to_download = [r for r in records_with_pdf if r.get("pmcid") not in existing_pmcids]
+                
+                if not records_to_download:
+                    await progress_queue.put({
+                        'type': 'log',
+                        'source': 'europepmc',
+                        'content': '✅ 所有文献均已缓存\n\n',
+                        'newline': True
+                    })
+                else:
+                    # 限制下载数量
+                    max_to_download = min(len(records_to_download), target_count - len(results))
+                    records_to_download = records_to_download[:max_to_download]
+                    
+                    await progress_queue.put({
+                        'type': 'log',
+                        'source': 'europepmc',
+                        'content': f'  📥 准备下载 {len(records_to_download)} 篇新文献...\n\n',
+                        'newline': True
+                    })
+                    
+                    # 并发下载
+                    download_tasks = []
+                    for record in records_to_download:
+                        task = self._download_europepmc_paper(record, progress_queue)
+                        download_tasks.append(task)
+                    
+                    # 等待所有下载任务完成
+                    papers = await asyncio.gather(*download_tasks, return_exceptions=True)
+                    
+                    for paper in papers:
+                        if paper and not isinstance(paper, Exception):
+                            results.append(paper)
+                            
+                            # 达到目标数量后停止
+                            if len(results) >= target_count:
+                                break
 
             await progress_queue.put({
                 'type': 'log',
                 'source': 'europepmc',
-                'content': f'✅ Europe PMC 检索完成，成功获取 {len(results)} 篇文献\n',
+                'content': f'\n✅ Europe PMC 检索完成，成功获取 {len(results)} 篇文献\n\n',
                 'newline': True
             })
 
@@ -601,7 +714,7 @@ class SearchService:
         await progress_queue.put({
             'type': 'log',
             'source': 'clinical_trials',
-            'content': f'\n🔍 开始检索临床试验: {keywords}\n',
+            'content': f'\n🔍 开始检索临床试验: {keywords}\n\n',
             'newline': True
         })
 
@@ -620,7 +733,7 @@ class SearchService:
                     await progress_queue.put({
                         'type': 'log',
                         'source': 'clinical_trials',
-                        'content': f'📚 数据库中找到 {len(cached)} 个已缓存试验\n',
+                        'content': f'📚 数据库中找到 {len(cached)} 个已缓存试验\n\n',
                         'newline': True
                     })
 
@@ -642,52 +755,56 @@ class SearchService:
                 await progress_queue.put({
                     'type': 'log',
                     'source': 'clinical_trials',
-                    'content': f'📥 找到 {len(trials)} 个临床试验\n',
+                    'content': f'📥 找到 {len(trials)} 个临床试验\n\n',
                     'newline': True
                 })
 
-                # 保存到数据库
+                # 批量检查已存在的试验
                 async with get_db_session() as db:
-                    for trial in trials:
-                        nct_id = trial["nct_id"]
-
-                        # 检查是否已存在
-                        result = await db.execute(
-                            select(ClinicalTrial).where(ClinicalTrial.nct_id == nct_id)
-                        )
-                        existing = result.scalar_one_or_none()
-
-                        if existing:
-                            all_trials.append(self._trial_to_dict(existing))
-                            continue
-
+                    nct_ids = [trial["nct_id"] for trial in trials]
+                    
+                    # 批量查询已存在的NCT ID
+                    result = await db.execute(
+                        select(ClinicalTrial).where(ClinicalTrial.nct_id.in_(nct_ids))
+                    )
+                    existing_trials = result.scalars().all()
+                    existing_nct_ids = {t.nct_id for t in existing_trials}
+                    
+                    # 添加已存在的试验到结果
+                    for trial in existing_trials:
+                        all_trials.append(self._trial_to_dict(trial))
+                    
+                    # 过滤出需要保存的试验
+                    trials_to_save = [t for t in trials if t["nct_id"] not in existing_nct_ids]
+                    
+                    if trials_to_save:
                         await progress_queue.put({
                             'type': 'log',
                             'source': 'clinical_trials',
-                            'content': f'  💊 保存 {nct_id}\n',
+                            'content': f'  💊 保存 {len(trials_to_save)} 个新试验...\n',
                             'newline': True
                         })
-
-                        # 保存到数据库
-                        await upsert_clinical_trial(
-                            db,
-                            nct_id=trial["nct_id"],
-                            title=trial["title"],
-                            official_title=trial.get("official_title"),
-                            status=trial.get("status"),
-                            start_date=trial.get("start_date"),
-                            completion_date=trial.get("completion_date"),
-                            study_type=trial.get("study_type"),
-                            phase=trial.get("phase"),
-                            allocation=trial.get("allocation"),
-                            intervention_model=trial.get("intervention_model"),
-                            conditions=trial.get("conditions"),
-                            sponsor=trial.get("sponsor"),
-                            locations=trial.get("locations"),
-                            source_url=trial.get("source_url"),
-                        )
-
-                        all_trials.append(trial)
+                        
+                        # 批量保存
+                        for trial in trials_to_save:
+                            await upsert_clinical_trial(
+                                db,
+                                nct_id=trial["nct_id"],
+                                title=trial["title"],
+                                official_title=trial.get("official_title"),
+                                status=trial.get("status"),
+                                start_date=trial.get("start_date"),
+                                completion_date=trial.get("completion_date"),
+                                study_type=trial.get("study_type"),
+                                phase=trial.get("phase"),
+                                allocation=trial.get("allocation"),
+                                intervention_model=trial.get("intervention_model"),
+                                conditions=trial.get("conditions"),
+                                sponsor=trial.get("sponsor"),
+                                locations=trial.get("locations"),
+                                source_url=trial.get("source_url"),
+                            )
+                            all_trials.append(trial)
 
             except Exception as e:
                 await progress_queue.put({

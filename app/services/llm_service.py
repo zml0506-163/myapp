@@ -99,37 +99,67 @@ class LLMService:
         if model is None:
             model = settings.qwen_max_model
 
-        try:
-            completion = await self.client.chat.completions.create(
-                model=model,
-                messages=messages,  # type: ignore
-                stream=True,
-                temperature=temperature,
-            )
+        retries = 0
+        wait_seconds = max(0, settings.llm_rate_limit_retry_wait_seconds)
+        max_retries = max(0, settings.llm_rate_limit_max_retries)
 
-            async for chunk in completion:
-                if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+        while True:
+            try:
+                completion = await self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,  # type: ignore
+                    stream=True,
+                    temperature=temperature,
+                )
 
-        except Exception as e:
-            logging.exception(e)
-            error_msg = str(e)
-            
-            # 提取更友好的错误信息
-            if hasattr(e, 'response') and e.response is not None:  # type: ignore
-                try:
-                    error_data = e.response.json()  # type: ignore
-                    error_msg = error_data.get('error', {}).get('message', str(e))
-                except:
-                    pass
-            
-            # 判断是否是配额耗尽错误
-            if 'AllocationQuota' in str(e) or 'FreeTierOnly' in str(e):
-                error_msg = "模型免费额度已用完,请在阿里云控制台开通付费服务或关闭'仅使用免费额度'模式"
-            
-            yield f"\n❌ 模型调用失败: {error_msg}\n"
-            # 抛出异常，让上层捕获
-            raise
+                async for chunk in completion:
+                    if chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+                # 正常完成则退出重试循环
+                return
+
+            except Exception as e:
+                # 解析错误码
+                is_rate_limited = False
+                error_msg = str(e)
+                if hasattr(e, 'response') and e.response is not None:  # type: ignore
+                    try:
+                        error_data = e.response.json()  # type: ignore
+                        error_msg = error_data.get('error', {}).get('message', str(e))
+                        code = error_data.get('error', {}).get('code')
+                        if code in ('limit_requests', 'rate_limit_exceeded') or 'Too Many Requests' in error_msg:
+                            is_rate_limited = True
+                    except Exception:
+                        pass
+
+                if is_rate_limited and retries < max_retries:
+                    retries += 1
+                    logging.getLogger('llm_service').warning(
+                        'Rate limited (429). retry %d/%d after %ds. msg=%s',
+                        retries, max_retries, wait_seconds, error_msg
+                    )
+                    # 等待后重试
+                    import asyncio as _asyncio
+                    await _asyncio.sleep(wait_seconds)
+                    continue
+
+                # 非限流或已超过最大重试，按原逻辑处理错误并抛出
+                logging.exception(e)
+
+                # 提取更友好的错误信息
+                if hasattr(e, 'response') and e.response is not None:  # type: ignore
+                    try:
+                        error_data = e.response.json()  # type: ignore
+                        error_msg = error_data.get('error', {}).get('message', str(e))
+                    except Exception:
+                        pass
+
+                # 判断是否是配额耗尽错误
+                if 'AllocationQuota' in str(e) or 'FreeTierOnly' in str(e):
+                    error_msg = "模型免费额度已用完,请在阿里云控制台开通付费服务或关闭'仅使用免费额度'模式"
+
+                yield f"\n❌ 模型调用失败: {error_msg}\n"
+                raise
 
     async def chat_with_context(
             self,

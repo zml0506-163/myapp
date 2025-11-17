@@ -72,7 +72,9 @@ class Settings(BaseModel):
     max_search_results: int = int(os.getenv("MAX_SEARCH_RESULTS", "5"))
 
     # PDF 下载超时配置（秒）
-    pdf_download_timeout: int = int(os.getenv("PDF_DOWNLOAD_TIMEOUT", "60"))  # 单个PDF下载超时
+    pdf_download_timeout: int = int(os.getenv("PDF_DOWNLOAD_TIMEOUT", "60"))  # 兼容字段（不再作为总超时使用）
+    pdf_download_total_timeout: int = int(os.getenv("PDF_DOWNLOAD_TOTAL_TIMEOUT", "300"))  # 总超时（默认5分钟）
+    pdf_download_idle_timeout: int = int(os.getenv("PDF_DOWNLOAD_IDLE_TIMEOUT", "60"))     # 空闲超时（无新数据）
     pdf_extract_timeout: int = int(os.getenv("PDF_EXTRACT_TIMEOUT", "30"))    # 解压超时
     webview_timeout: int = int(os.getenv("WEBVIEW_TIMEOUT", "90"))            # 浏览器抓取超时
 
@@ -88,6 +90,10 @@ class Settings(BaseModel):
 
     # 检索倍数（检索数量 = 目标数量 * 倍数）
     search_multiplier: int = int(os.getenv("SEARCH_MULTIPLIER", "3"))
+
+    # LLM 限流重试配置
+    llm_rate_limit_retry_wait_seconds: int = int(os.getenv("LLM_RATE_LIMIT_RETRY_WAIT_SECONDS", "15"))
+    llm_rate_limit_max_retries: int = int(os.getenv("LLM_RATE_LIMIT_MAX_RETRIES", "3"))
 
     # ============================================
     # 日志配置

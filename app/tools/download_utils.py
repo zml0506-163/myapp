@@ -8,13 +8,12 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import requests
+import time
 
 from DrissionPage import Chromium
 from DrissionPage._configs.chromium_options import ChromiumOptions
 from pathlib import Path
 from typing import Optional, Callable
-
-from urllib3.exceptions import InsecureRequestWarning
 
 from app.core.config import settings
 
@@ -25,7 +24,6 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Referer': 'https://pubmed.ncbi.nlm.nih.gov/',
     'Accept-Language': 'en-US,en;q=0.5'
 }
 
@@ -36,7 +34,8 @@ DOWNLOAD_HEADERS = {
 }
 
 # 超时设置（秒）
-DOWNLOAD_TIMEOUT = 60  # 单个文件下载超时
+# DOWNLOAD_TIMEOUT 作为“空闲读超时”，每次读取或网络空闲超过该时间将超时
+DOWNLOAD_TIMEOUT = settings.pdf_download_idle_timeout
 EXTRACT_TIMEOUT = 30   # 解压超时
 WEBVIEW_TIMEOUT = 90   # 浏览器抓取超时
 
@@ -197,6 +196,7 @@ def _download_pdf_from_ftp(url: str, filename: str, progress_callback):
             ftp.login(username, password)
             ftp.set_pasv(True)
             if ftp.sock:
+                # 空闲读超时：若超过该时间没有数据返回，则抛出超时
                 ftp.sock.settimeout(DOWNLOAD_TIMEOUT)
 
             try:
@@ -274,6 +274,7 @@ def _download_tgz_from_ftp(url: str, filename: str, progress_callback):
             ftp.login(username, password)
             ftp.set_pasv(True)
             if ftp.sock:
+                # 空闲读超时：若超过该时间没有数据返回，则抛出超时
                 ftp.sock.settimeout(DOWNLOAD_TIMEOUT)
 
             try:
@@ -346,13 +347,68 @@ def _extract_pdf_from_tgz_content(content: bytes, filename: str, url: str, progr
 
 
 def download_pdf_sync(url: str, filename: str, progress_callback: Callable[[str, bool], None]) -> Optional[Path]:
-    """同步下载PDF文件（带超时控制）"""
+    """同步下载PDF文件（支持总超时与空闲超时，HTTP流式进度）"""
     warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
     try:
+        # HTTP/HTTPS：采用流式读取，按块更新进度，支持空闲超时与总超时
         if url.startswith(('http://', 'https://')):
-            with requests.get(url, headers=DOWNLOAD_HEADERS, timeout=DOWNLOAD_TIMEOUT, stream=True, verify=False) as resp:
-                return _handle_http_response(resp, url, filename, progress_callback)
+            total_timeout = settings.pdf_download_total_timeout
+            idle_timeout = settings.pdf_download_idle_timeout
+            start_ts = time.time()
+            last_progress_ts = start_ts
+            chunk_size = 64 * 1024  # 64KB
+
+            with requests.get(
+                url,
+                headers=DOWNLOAD_HEADERS,
+                timeout=(idle_timeout, idle_timeout),  # 连接&读取超时均为空闲超时
+                stream=True,
+                verify=False
+            ) as resp:
+                if not (resp.status_code in (200, 206) and resp.headers.get("Content-Type", "").startswith("application/")):
+                    # 回落到旧逻辑尝试直接处理完整响应
+                    return _handle_http_response(resp, url, filename, progress_callback)
+
+                path = BASE_DIR / filename
+                total_bytes = 0
+                header_checked = False
+                buffer_head = b""
+
+                with open(path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        now = time.time()
+                        # 总超时控制
+                        if now - start_ts > total_timeout:
+                            progress_callback(f"下载超时（{total_timeout}秒）", False)
+                            return None
+
+                        # 处理空块
+                        if not chunk:
+                            if now - last_progress_ts > idle_timeout:
+                                progress_callback(f"空闲超时（{idle_timeout}秒）", False)
+                                return None
+                            continue
+
+                        f.write(chunk)
+                        total_bytes += len(chunk)
+                        last_progress_ts = now
+
+                        # 检查PDF头
+                        if not header_checked:
+                            buffer_head += chunk[:5 - len(buffer_head)] if len(buffer_head) < 5 else b""
+                            if len(buffer_head) >= 5:
+                                if not buffer_head.startswith(b"%PDF"):
+                                    progress_callback("不是PDF", False)
+                                    return None
+                                header_checked = True
+
+                        # 每100KB报一次进度
+                        if total_bytes % (100 * 1024) < len(chunk):
+                            progress_callback(f"已下载 {total_bytes // 1024} KB...", True)
+
+                progress_callback("成功下载", True)
+                return path
 
         elif url.startswith('ftp://'):
             return _download_pdf_from_ftp(url, filename, progress_callback)

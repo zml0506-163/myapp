@@ -6,6 +6,7 @@ import os
 import json
 from typing import TypedDict, AsyncGenerator, List, Dict, Optional
 import asyncio
+import logging
 from sqlalchemy import select, func, update
 
 from app.core.config import settings
@@ -19,6 +20,7 @@ from app.schemas.message import MessageCreateSchema
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 class WorkflowState(TypedDict):
@@ -153,7 +155,7 @@ class WorkflowService:
             'type': 'log',
             'step': 'extract_features',
             'source': 'extract_features',
-            'content': '正在分析患者信息...\n',
+            'content': '正在分析患者信息...\n\n',
             'newline': True
         }
 
@@ -186,7 +188,7 @@ class WorkflowService:
                     'type': 'log',
                     'step': 'extract_features',
                     'source': 'extract_features',
-                    'content': f'正在上传和解析 {len(state["user_attachments"])} 个文件...\n',
+                    'content': f'正在上传和解析 {len(state["user_attachments"])} 个文件...\n\n',
                     'newline': True
                 }
                 
@@ -199,7 +201,7 @@ class WorkflowService:
                     'type': 'log',
                     'step': 'extract_features',
                     'source': 'extract_features',
-                    'content': '文件上传完成，正在解析文件内容...\n',
+                    'content': '文件上传完成，正在解析文件内容...\n\n',
                     'newline': True
                 }
 
@@ -319,7 +321,7 @@ class WorkflowService:
             'type': 'log',
             'step': 'generate_queries',
             'source': 'generate_queries',
-            'content': '正在生成检索条件...\n',
+            'content': '正在生成检索条件...\n\n',
             'newline': True
         }
 
@@ -418,6 +420,7 @@ class WorkflowService:
             'title': '📚 执行多源检索',
             'collapsible': True
         }
+        logging.getLogger("workflow_service").info("section_start search")
 
         progress_queue = asyncio.Queue()
         target_count = settings.max_search_results
@@ -486,6 +489,20 @@ class WorkflowService:
                         progress_queue
                     )
                     state['trials'].extend(trials)
+                    try:
+                        logging.getLogger("workflow_service").info(
+                            "trials fetched count=%d keywords=%s",
+                            len(state['trials']),
+                            state.get('clinical_trial_keywords')
+                        )
+                        # 采样前3个标题用于快速确认
+                        sample_titles = [t.get('title') for t in state['trials'][:3]]
+                        logging.getLogger("workflow_service").info(
+                            "trials sample titles=%s",
+                            sample_titles
+                        )
+                    except Exception:
+                        pass
 
                 except Exception as e:
                     await progress_queue.put({
@@ -507,8 +524,13 @@ class WorkflowService:
                 if isinstance(msg, dict):
                     if msg.get('type') == 'DONE':
                         break
-                    elif msg.get('type') in ('log', 'result'):
+                    elif msg.get('type') in ('log', 'result', 'progress'):
                         # 直接转发
+                        if msg.get('type') == 'progress':
+                            logging.getLogger("workflow_service").info(
+                                "forward progress source=%s id=%s status=%s",
+                                msg.get('source'), msg.get('id'), msg.get('status')
+                            )
                         yield msg
 
             await search_task
@@ -579,7 +601,7 @@ class WorkflowService:
                 'type': 'log',
                 'step': 'analyze_papers',
                 'source': 'analyze_papers',
-                'content': f'\n📄 分析文献 {i+1}/{len(state["papers"])}: {paper["title"][:50]}...\n',
+                'content': f'\n📄 分析文献 {i+1}/{len(state["papers"])}: {paper["title"][:50]}...\n\n',
                 'newline': True
             }
 
@@ -687,7 +709,7 @@ class WorkflowService:
             'type': 'log',
             'step': 'analyze_trials',
             'source': 'analyze_trials',
-            'content': f'正在分析 {len(state["trials"])} 个临床试验...\n',
+            'content': f'正在分析 {len(state["trials"])} 个临床试验...\n\n',
             'newline': True
         }
 
@@ -709,12 +731,20 @@ class WorkflowService:
 
         analysis = ""
         try:
+            logger.info(
+                "analyze_trials start trials=%d model=%s prompt_len=%d",
+                len(state['trials']),
+                settings.qwen_long_model,
+                len(prompt)
+            )
+            _token_count = 0
             async for token in llm_service.chat_with_context(
                     user_query=prompt,
                     system_prompt="你是一个专业的临床试验分析助手。",
                     model=settings.qwen_long_model
             ):
                 analysis += token
+                _token_count += 1
                 # 流式输出结果（增量）
                 yield {
                     'type': 'result',
@@ -722,6 +752,14 @@ class WorkflowService:
                     'content': token,
                     'is_incremental': True
                 }
+
+            logger.info(
+                "analyze_trials done tokens=%d content_len=%d",
+                _token_count,
+                len(analysis)
+            )
+            if not analysis:
+                logger.warning("No analysis output")
 
             state['trial_analysis'] = analysis
             
@@ -742,6 +780,7 @@ class WorkflowService:
                 'content': f'❌ 分析失败: {str(e)}\n',
                 'newline': True
             }
+            logger.exception("analyze_trials error: %s", str(e))
 
         yield {'type': 'section_end', 'step': 'analyze_trials'}
 
@@ -760,7 +799,7 @@ class WorkflowService:
             'type': 'log',
             'step': 'generate_final',
             'source': 'generate_final',
-            'content': '正在生成综合报告...\n',
+            'content': '正在生成综合报告...\n\n',
             'newline': True
         }
 

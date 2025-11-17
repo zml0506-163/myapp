@@ -10,7 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from pathlib import Path
 
-from starlette.responses import StreamingResponse, FileResponse
+from starlette.responses import StreamingResponse, FileResponse, JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.staticfiles import StaticFiles
 
 from app.api.v1 import api_router
@@ -364,3 +365,17 @@ async def download_file(pdf_path: str):
 
 
 app.mount("/", StaticFiles(directory="frontend/dist", html=True), name="frontend")
+
+# SPA fallback: for non-API routes that 404, return index.html so SPA routes like /register work on refresh
+@app.exception_handler(StarletteHTTPException)
+async def spa_fallback(request: Request, exc: StarletteHTTPException):
+    # Only intercept 404 and only for non-API paths
+    if exc.status_code == 404:
+        path = request.url.path or "/"
+        if not (path.startswith("/api") or path.startswith("/api/files")):
+            index_path = os.path.join("frontend", "dist", "index.html")
+            if os.path.exists(index_path):
+                return FileResponse(index_path, media_type="text/html")
+    # Fallback to original JSON 404
+    detail = getattr(exc, "detail", "Not Found")
+    return JSONResponse({"detail": detail}, status_code=exc.status_code)

@@ -30,7 +30,10 @@ class PubMedClient:
     """优化的 PubMed 客户端"""
 
     def __init__(self):
-        self.download_timeout = settings.pdf_download_timeout
+        # 兼容旧字段，新增：总超时与空闲超时
+        self.download_timeout = settings.pdf_download_total_timeout
+        self.total_timeout = settings.pdf_download_total_timeout
+        self.idle_timeout = settings.pdf_download_idle_timeout
         self.max_retries = settings.pdf_download_max_retries
         self.max_concurrent = settings.max_concurrent_downloads
         self._semaphore = asyncio.Semaphore(self.max_concurrent)
@@ -48,7 +51,7 @@ class PubMedClient:
             "retmax": str(retmax)
         }
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=self.total_timeout) as client:
             r = await client.get(f"{EUTILS}/esearch.fcgi", params=params)
             r.raise_for_status()
             j = r.json()
@@ -65,7 +68,7 @@ class PubMedClient:
             "retmode": "xml"
         }
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=self.total_timeout) as client:
             r = await client.get(f"{EUTILS}/efetch.fcgi", params=params)
             r.raise_for_status()
             xml_text = r.text
@@ -169,7 +172,7 @@ class PubMedClient:
             return pdf_path
 
         except asyncio.TimeoutError:
-            progress_callback(f"下载超时（{self.download_timeout}秒）", False)
+            progress_callback(f"下载超时（{self.total_timeout}秒）", False)
             logger.warning(f"PMID {pmid} 下载超时")
             return None
         except Exception as e:
@@ -206,7 +209,7 @@ class PubMedClient:
                             f"{pmid}.pdf",
                             progress_callback
                         ),
-                        timeout=self.download_timeout
+                        timeout=self.total_timeout
                     )
                 elif url_type == "webview":
                     pdf_path = await asyncio.wait_for(
@@ -219,7 +222,7 @@ class PubMedClient:
                             page_wait_selector,
                             progress_callback
                         ),
-                        timeout=self.download_timeout
+                        timeout=self.total_timeout
                     )
                 else:
                     pdf_path = await asyncio.wait_for(
@@ -230,7 +233,7 @@ class PubMedClient:
                             f"{pmid}.pdf",
                             progress_callback
                         ),
-                        timeout=self.download_timeout
+                        timeout=self.total_timeout
                     )
 
                 if pdf_path:
