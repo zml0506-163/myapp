@@ -30,7 +30,10 @@ const routes = [
     // 可以添加其他页面路由
     {
         path: '/',
-        redirect: '/chat' // 默认跳转到聊天页面
+        redirect: (to) => {
+            // 检查认证状态，如果已认证则跳转到聊天页面，否则跳转到登录页
+            return isAuthenticated() ? '/chat' : '/login'
+        }
     }
 ]
 

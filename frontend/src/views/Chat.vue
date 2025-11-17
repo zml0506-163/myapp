@@ -198,6 +198,35 @@
                     
                     <!-- 区块内容 -->
                     <div v-show="!section.collapsed" class="section-content">
+                      <!-- 下载任务表格（仅在搜索区块显示） -->
+                      <div v-if="section.step === 'search' && section.downloadsMap && Object.keys(section.downloadsMap).length > 0" class="downloads-container">
+                        <table class="downloads-table">
+                          <thead>
+                            <tr>
+                              <th style="width: 28%">ID</th>
+                              <th style="width: 12%">来源</th>
+                              <th>标题</th>
+                              <th style="width: 14%">状态</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr v-for="item in Object.values(section.downloadsMap)" :key="item.id">
+                              <td>{{ item.id }}</td>
+                              <td>{{ item.source }}</td>
+                              <td>{{ item.title || '' }}</td>
+                              <td>
+                                <el-tag
+                                  :type="item.status === 'success' ? 'success' : (item.status === 'failed' ? 'danger' : (item.status === 'queued' ? 'info' : 'warning'))"
+                                  size="small"
+                                >
+                                  {{ item.status }}
+                                </el-tag>
+                              </td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+
                       <!-- 日志 -->
                       <div v-if="section.logs && section.logs.length > 0" class="logs-container">
                         <span
@@ -207,7 +236,21 @@
                           v-html="log.content"
                         ></span>
                       </div>
-                      
+
+                      <!-- 任务分组日志（仅在搜索区块显示） -->
+                      <div v-if="section.step === 'search' && section.logsByItem && Object.keys(section.logsByItem).length > 0" class="item-logs-container">
+                        <div
+                          v-for="(logs, itemId) in section.logsByItem"
+                          :key="`itemlogs-${idx}-${itemId}`"
+                          class="item-log-block"
+                        >
+                          <div class="item-log-header">{{ itemId }}</div>
+                          <div class="item-log-body">
+                            <div v-for="(entry, eIdx) in logs" :key="`itemlog-${idx}-${itemId}-${eIdx}`" class="item-log-line" v-html="entry.content"></div>
+                          </div>
+                        </div>
+                      </div>
+
                       <!-- 结果 -->
                       <div v-if="section.results && section.results.length > 0" class="results-container">
                         <div
@@ -701,7 +744,7 @@ const reconnectStream = async (messageId) => {
         if (line.startsWith('data: ')) {
           try {
             const data = JSON.parse(line.slice(6))
-            
+
             // 复用事件处理逻辑
             if (data.type === 'section_start') {
               currentSection = {
@@ -713,9 +756,16 @@ const reconnectStream = async (messageId) => {
                 results: [],
                 summary: ''
               }
+              if (data.step === 'generate_final') {
+                currentSection.results = [{ content: '', data: null }]
+              }
+              if (data.step === 'search') {
+                currentSection.downloadsMap = {}
+                currentSection.logsByItem = {}
+              }
               workflowSections.value = [...workflowSections.value, currentSection]
               isWorkflowMode.value = true
-              
+
             } else if (data.type === 'section_end') {
               if (currentSection) {
                 const idx = workflowSections.value.findIndex(s => s.step === currentSection.step)
@@ -728,29 +778,25 @@ const reconnectStream = async (messageId) => {
                 }
               }
               currentSection = null
-              
+
             } else if (data.type === 'log') {
               let targetSection = currentSection
-              
               if (data.source === 'attachment' && !targetSection) {
                 const attachmentSectionIdx = workflowSections.value.findIndex(s => s.step === 'attachment_processing')
                 if (attachmentSectionIdx !== -1) {
                   targetSection = workflowSections.value[attachmentSectionIdx]
                 }
               }
-              
               if (!targetSection && data.step) {
                 const sectionIdx = workflowSections.value.findIndex(s => s.step === data.step)
                 if (sectionIdx !== -1) {
                   targetSection = workflowSections.value[sectionIdx]
                 }
               }
-              
               if (targetSection) {
                 const sectionIdx = workflowSections.value.findIndex(s => s.step === targetSection.step)
                 if (sectionIdx !== -1) {
                   const section = workflowSections.value[sectionIdx]
-                  
                   if (data.newline === false && section.logs.length > 0) {
                     const lastIdx = section.logs.length - 1
                     const updatedLogs = [...section.logs]
@@ -771,60 +817,34 @@ const reconnectStream = async (messageId) => {
                       }]
                     }
                   }
-                }
-              }
-              
-            } else if (data.type === 'result') {
-              let targetSection = currentSection
-              
-              if (!targetSection && data.step) {
-                const sectionIdx = workflowSections.value.findIndex(s => s.step === data.step)
-                if (sectionIdx !== -1) {
-                  targetSection = workflowSections.value[sectionIdx]
-                }
-              }
-              
-              if (targetSection) {
-                const sectionIdx = workflowSections.value.findIndex(s => s.step === targetSection.step)
-                if (sectionIdx !== -1) {
-                  const section = workflowSections.value[sectionIdx]
-                  
-                  const updates = {}
-                  if (data.content !== undefined) {
-                    if (section.results && section.results.length > 0) {
-                      const updatedResults = [...section.results]
-                      
-                      if (data.is_incremental) {
-                        updatedResults[updatedResults.length - 1] = {
-                          content: updatedResults[updatedResults.length - 1].content + data.content,
-                          data: data.data
-                        }
-                      } else {
-                        updatedResults[updatedResults.length - 1] = {
-                          content: data.content,
-                          data: data.data
-                        }
-                      }
-                      
-                      updates.results = updatedResults
-                    } else {
-                      updates.results = [{
-                        content: data.content,
-                        data: data.data
-                      }]
+                  // 分组日志
+                  if (data.item_id && targetSection.step === 'search') {
+                    const logsByItem = { ...(workflowSections.value[sectionIdx].logsByItem || {}) }
+                    const list = logsByItem[data.item_id] ? [...logsByItem[data.item_id]] : []
+                    list.push({ content: data.content, time: Date.now() })
+                    logsByItem[data.item_id] = list
+                    workflowSections.value[sectionIdx] = {
+                      ...workflowSections.value[sectionIdx],
+                      logsByItem
                     }
                   }
-                  if (data.summary) {
-                    updates.summary = data.summary
-                  }
-                  
-                  workflowSections.value[sectionIdx] = {
-                    ...section,
-                    ...updates
-                  }
                 }
               }
-              
+
+            } else if (data.type === 'progress') {
+              const searchIdx = workflowSections.value.findIndex(s => s.step === 'search')
+              if (searchIdx !== -1) {
+                const section = workflowSections.value[searchIdx]
+                const downloadsMap = { ...(section.downloadsMap || {}) }
+                const id = data.id
+                const prev = downloadsMap[id] || { id }
+                downloadsMap[id] = { ...prev, ...data }
+                workflowSections.value[searchIdx] = {
+                  ...section,
+                  downloadsMap
+                }
+              }
+
             } else if (data.type === 'token') {
               if (isWorkflowMode.value) {
                 if (!currentSection) {
@@ -1020,7 +1040,16 @@ const handleSend = async () => {
                 results: [],
                 summary: ''
               }
+              // 为最终报告区块预置一个结果占位，便于 token 增量追加
+              if (data.step === 'generate_final') {
+                currentSection.results = [{ content: '', data: null }]
+              }
+              if (data.step === 'search') {
+                currentSection.downloadsMap = {}
+                currentSection.logsByItem = {}
+              }
               workflowSections.value = [...workflowSections.value, currentSection]
+              isWorkflowMode.value = true
               console.log('[DEBUG] 开始新区块:', data.step)
               
             } else if (data.type === 'section_end') {
@@ -1093,9 +1122,34 @@ const handleSend = async () => {
                       }]
                     }
                   }
+                  // 分组日志（按 item_id）
+                  if (data.item_id && targetSection.step === 'search') {
+                    const logsByItem = { ...(workflowSections.value[sectionIdx].logsByItem || {}) }
+                    const list = logsByItem[data.item_id] ? [...logsByItem[data.item_id]] : []
+                    list.push({ content: data.content, time: Date.now() })
+                    logsByItem[data.item_id] = list
+                    workflowSections.value[sectionIdx] = {
+                      ...workflowSections.value[sectionIdx],
+                      logsByItem
+                    }
+                  }
                 }
               }
               console.log('[DEBUG] 处理日志事件:', data.source, data.content.substring(0, 50))
+            } else if (data.type === 'progress') {
+              // 下载任务表格 upsert（搜索区块）
+              const searchIdx = workflowSections.value.findIndex(s => s.step === 'search')
+              if (searchIdx !== -1) {
+                const section = workflowSections.value[searchIdx]
+                const downloadsMap = { ...(section.downloadsMap || {}) }
+                const id = data.id
+                const prev = downloadsMap[id] || { id }
+                downloadsMap[id] = { ...prev, ...data }
+                workflowSections.value[searchIdx] = {
+                  ...section,
+                  downloadsMap
+                }
+              }
             } else if (data.type === 'result') {
               // 查找目标区块
               let targetSection = currentSection
@@ -1361,6 +1415,57 @@ const handleDownloadAttachment = async (attachment) => {
 </script>
 
 <style scoped>
+/* ============================================
+   基础容器样式
+   ============================================ */
+/* 下载任务表格样式 */
+.downloads-container {
+  margin: 8px 0 12px;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.downloads-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.downloads-table thead tr {
+  background: #f5f7fa;
+}
+.downloads-table th, .downloads-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #f0f2f5;
+  text-align: left;
+}
+.downloads-table tbody tr:hover {
+  background: #fafafa;
+}
+
+/* 任务分组日志样式 */
+.item-logs-container {
+  margin-top: 10px;
+}
+.item-log-block {
+  border: 1px dashed #e4e7ed;
+  border-radius: 6px;
+  margin-bottom: 8px;
+}
+.item-log-header {
+  background: #fafafa;
+  padding: 6px 10px;
+  font-weight: 500;
+  color: #606266;
+}
+.item-log-body {
+  padding: 6px 10px;
+  color: #606266;
+  line-height: 1.6;
+}
+.item-log-line + .item-log-line {
+  margin-top: 4px;
+}
+
 /* ============================================
    基础容器样式
    ============================================ */
@@ -1940,8 +2045,6 @@ const handleDownloadAttachment = async (attachment) => {
   border-radius: 4px;
   font-family: 'Courier New', monospace;
   font-size: 12px;
-  max-height: 250px;
-  overflow-y: auto;
   line-height: 1.4;
 }
 
