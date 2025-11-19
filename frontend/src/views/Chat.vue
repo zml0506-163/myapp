@@ -883,6 +883,16 @@ const reconnectStream = async (messageId) => {
               isSending.value = false
               currentReader.value = null
               await chatStore.fetchMessages(chatStore.currentConversationId)
+              // 刷新对话列表，以更新标题
+              await chatStore.fetchConversations()
+              
+            } else if (data.type === 'title_updated') {
+              // 标题更新事件：更新对话列表中的标题
+              const conv = chatStore.conversations.find(c => c.id === data.conversation_id)
+              if (conv) {
+                conv.title = data.title
+              }
+              console.log('[DEBUG] 对话标题已更新:', data.title)
               
             } else if (data.type === 'error') {
               ElMessage.error(data.content)
@@ -1247,6 +1257,8 @@ const handleSend = async () => {
               isAITyping.value = false
               currentReader.value = null
               await chatStore.fetchMessages(chatStore.currentConversationId)
+              // 刷新对话列表，以更新标题
+              await chatStore.fetchConversations()
               console.log('[DEBUG] 生成完成')
               
             } else if (data.type === 'title_updated') {
@@ -1828,6 +1840,7 @@ const handleDownloadAttachment = async (attachment) => {
   color: #303133;
   border: 1px solid #e4e7ed;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  min-width: 300px; /* 确保 assistant 回答有最小宽度 */
 }
 
 .user-text {

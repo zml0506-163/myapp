@@ -50,6 +50,10 @@ cryptography==46.0.3
 
 # Literature Search
 metapub==0.6.4
+
+# MCP
+fastmcp
+
 eutils==0.6.0
 
 # Cache

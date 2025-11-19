@@ -4,6 +4,7 @@ app/core/config.py
 """
 from pydantic import BaseModel
 import os
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -46,6 +47,61 @@ class Settings(BaseModel):
         self.log_file = os.getenv("LOG_FILE", "true").lower() == "true"
         self.log_color = os.getenv("LOG_COLOR", "false").lower() == "true"
         self.use_redis_cache = os.getenv("USE_REDIS_CACHE", "false").lower() == "true"
+        self.mcp_enabled = os.getenv("MCP_ENABLED", "false").lower() == "true"
+        wl = os.getenv("MCP_TOOL_WHITELIST", "").strip()
+        self.mcp_tool_whitelist = [x.strip() for x in wl.split(",") if x.strip()] if wl else []
+        self.mcp_base_url = os.getenv("MCP_BASE_URL", "").strip()
+        self.deliberate_enabled = os.getenv("DELIBERATE_ENABLED", "false").lower() == "true"
+
+        # 可选：从 JSON 覆盖 MCP 配置（优先级高于环境变量）
+        cfg_text = os.getenv("MCP_CONFIG_JSON", "").strip()
+        cfg_path = os.getenv("MCP_CONFIG_PATH", "").strip()
+        cfg = None
+        if cfg_text:
+            try:
+                cfg = json.loads(cfg_text)
+            except Exception:
+                cfg = None
+        elif cfg_path:
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except Exception:
+                cfg = None
+        if isinstance(cfg, dict):
+            try:
+                if "base_url" in cfg:
+                    v = (cfg.get("base_url") or "").strip()
+                    if v:
+                        self.mcp_base_url = v
+                if "enabled" in cfg and isinstance(cfg.get("enabled"), bool):
+                    self.mcp_enabled = bool(cfg.get("enabled"))
+                server = cfg.get("server") or {}
+                if isinstance(server, dict) and isinstance(server.get("port"), int):
+                    port = server.get("port"); assert isinstance(port, int)
+                    self.mcp_server_port = int(port)
+                auth = cfg.get("auth") or {}
+                if isinstance(auth, dict):
+                    if auth.get("header"):
+                        self.mcp_auth_header = str(auth.get("header"))
+                    if auth.get("token") is not None:
+                        self.mcp_auth_token = str(auth.get("token"))
+                to = cfg.get("timeouts") or {}
+                if isinstance(to, dict):
+                    if isinstance(to.get("request_seconds"), int):
+                        req_sec = to.get("request_seconds")
+                        assert isinstance(req_sec, int)
+                        self.mcp_request_timeout_seconds = int(req_sec)
+                    if isinstance(to.get("stream_seconds"), int):
+                        stream_sec = to.get("stream_seconds")
+                        assert isinstance(stream_sec, int)
+                        self.mcp_stream_timeout_seconds = int(stream_sec)
+                wl = cfg.get("whitelist")
+                if isinstance(wl, list):
+                    self.mcp_tool_whitelist = [str(x).strip() for x in wl if str(x).strip()]
+            except Exception:
+                # JSON 配置解析失败不应影响应用启动
+                pass
 
     # CORS 配置
     allowed_origins: list[str] = [
@@ -110,6 +166,30 @@ class Settings(BaseModel):
     use_redis_cache: bool = False  # 是否使用 Redis 缓存
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")  # Redis 连接地址
     redis_cache_expire: int = int(os.getenv("REDIS_CACHE_EXPIRE", "3600"))  # Redis 缓存默认过期时间（秒）
+
+    # ============================================
+    # 路由展示开关（仅展示计划日志，不改流程）
+    # ============================================
+
+    # ============================================
+    # MCP 相关配置
+    # ============================================
+    mcp_enabled: bool = False
+    mcp_server_port: int = int(os.getenv("MCP_SERVER_PORT", "0"))
+    mcp_tool_whitelist: list[str] = []
+    mcp_base_url: str = os.getenv("MCP_BASE_URL", "")
+    # MCP HTTP 客户端配置
+    mcp_request_timeout_seconds: int = int(os.getenv("MCP_REQUEST_TIMEOUT_SECONDS", "30"))
+    mcp_stream_timeout_seconds: int = int(os.getenv("MCP_STREAM_TIMEOUT_SECONDS", "120"))
+    mcp_auth_header: str = os.getenv("MCP_AUTH_HEADER", "Authorization")
+    mcp_auth_token: str = os.getenv("MCP_AUTH_TOKEN", "")
+
+    # ============================================
+    # 深度思考/评审（展示型开关，默认关闭）
+    # ============================================
+    deliberate_enabled: bool = False
+    deliberate_budget_tokens: int = int(os.getenv("DELIBERATE_BUDGET_TOKENS", "0"))
+    deliberate_max_time_ms: int = int(os.getenv("DELIBERATE_MAX_TIME_MS", "0"))
 
 
     class Config:

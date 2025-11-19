@@ -24,6 +24,8 @@ from app.tools.pubmed_client import pubmed_client
 from app.core.config import settings
 from app.tools.clinical_trials_client import async_search_trials
 from app.core.logger import logger
+from app.tools_api.factory import resolve_tool_facade
+from app.tools_api.mcp_adapters.fastmcp_server import mcp_app
 
 app = FastAPI(
     title=settings.project_name,
@@ -43,12 +45,16 @@ app.add_middleware(
 )
 
 # 创建全局线程池（避免重复创建，推荐在应用启动时初始化）
-# 可根据服务器性能调整max_workers（建议5-10）
+# 可根据服务器性能调整max_workers（建议3-5）
 executor = ThreadPoolExecutor(max_workers=5)
 
 
-# 注册路由
+# 注册API路由
 app.include_router(api_router, prefix=settings.api_prefix)
+
+# 挂载内嵌 MCP 服务（与主 FastAPI 同进程运行）
+if getattr(settings, 'mcp_enabled', False):
+    app.mount("/mcp", mcp_app)
 
 app.mount("/api/files", StaticFiles(directory=settings.pdf_dir), name="files")
 
@@ -67,7 +73,7 @@ def to_json(obj):
     return json.dumps(obj, ensure_ascii=False)
 
 
-# 启动建表
+# 应用启动事件：初始化数据库和存储目录
 @app.on_event("startup")
 async def on_startup():
     logger.info("应用启动：初始化数据库和存储目录")
@@ -220,7 +226,7 @@ async def search(request: Request, db: AsyncSession = Depends(get_db)):
     return StreamingResponse(queue_yielder(), media_type="text/event-stream")
 
 
-# 在应用关闭时优雅关闭线程池
+# 应用关闭事件：优雅关闭线程池
 @app.on_event("shutdown")
 def shutdown_event():
     logger.info("应用关闭：清理资源")
@@ -362,6 +368,79 @@ async def download_file(pdf_path: str):
         filename=os.path.basename(full_path),
         media_type="application/pdf"  # 对于PDF文件的MIME类型
     )
+
+
+# =====================
+# DEV: 工具接口层试验端点（不影响现有流程）
+# 说明：接受 patient_features、keywords、size；先检索试验，再流式分析，逐字推送。
+# =====================
+
+@app.post("/api/dev/trials_analyze")
+async def dev_trials_analyze(request: Request):
+    data = await request.json()
+    patient_features = data.get("patient_features", "")
+    keywords = data.get("keywords", "")
+    size = int(data.get("size", 3))
+
+    tools = resolve_tool_facade()
+
+    async def stream():
+        try:
+            # 前置：检索试验
+            yield build_msg("text", f"开始检索临床试验: {keywords}\n", True)
+            trials_result = await tools.search_trials(keywords, size)
+            yield build_msg("text", f"已获取 {len(trials_result.trials)} 个试验，开始分析...\n\n", True)
+
+            # 流式分析
+            stream = await tools.analyze_trials_stream(patient_features, trials_result.trials)
+            async for token in stream:
+                if token:
+                    yield build_msg("text", token, False)
+
+            yield build_msg("done", "")
+        except Exception as e:
+            yield build_msg("text", f"发生错误：{str(e)}\n", True)
+            yield build_msg("done", "")
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+# =====================
+# DEV: 严格 SSE 帧端点（data: 帧 + 空行分隔）
+# 说明：仅用于调试，功能等价于 /api/dev/trials_analyze。
+# =====================
+
+@app.post("/api/dev/trials_analyze_sse")
+async def dev_trials_analyze_sse(request: Request):
+    data = await request.json()
+    patient_features = data.get("patient_features", "")
+    keywords = data.get("keywords", "")
+    size = int(data.get("size", 3))
+
+    tools = resolve_tool_facade()
+
+    def sse_frame(obj: dict) -> str:
+        return "data: " + to_json(obj) + "\n\n"
+
+    async def stream():
+        try:
+            # 前置：检索试验
+            yield sse_frame({"type": "text", "content": f"开始检索临床试验: {keywords}\n", "newline": True})
+            trials_result = await tools.search_trials(keywords, size)
+            yield sse_frame({"type": "text", "content": f"已获取 {len(trials_result.trials)} 个试验，开始分析...\n\n", "newline": True})
+
+            # 流式分析
+            stream = await tools.analyze_trials_stream(patient_features, trials_result.trials)
+            async for token in stream:
+                if token:
+                    yield sse_frame({"type": "text", "content": token, "newline": False})
+
+            yield sse_frame({"type": "done", "content": ""})
+        except Exception as e:
+            yield sse_frame({"type": "text", "content": f"发生错误：{str(e)}\n", "newline": True})
+            yield sse_frame({"type": "done", "content": ""})
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 app.mount("/", StaticFiles(directory="frontend/dist", html=True), name="frontend")

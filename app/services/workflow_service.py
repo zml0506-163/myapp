@@ -4,7 +4,8 @@ app/services/workflow_service.py
 """
 import os
 import json
-from typing import TypedDict, AsyncGenerator, List, Dict, Optional
+import time
+from typing import TypedDict, AsyncGenerator, List, Dict, Optional, Set
 import asyncio
 import logging
 from sqlalchemy import select, func, update
@@ -18,6 +19,9 @@ from app.models import WorkflowExecution, Message, MessageType, MessageStatus
 from app.crud import message as crud_message
 from app.schemas.message import MessageCreateSchema
 from app.core.logger import get_logger
+from app.tools_api.factory import resolve_tool_facade
+from app.tools_api.models import Trial as ToolTrial
+from app.workflows.router import make_plan
 
 logger = get_logger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +45,7 @@ class WorkflowState(TypedDict):
     final_answer: str
     current_step: str
     errors: List[str]
+    intent: Dict[str, bool]
 
 
 class WorkflowService:
@@ -48,6 +53,25 @@ class WorkflowService:
 
     def __init__(self):
         self.prompts = WorkflowPrompts()
+        # 工具接口层（可切换 local/mcp），保持向后兼容
+        self.tools = resolve_tool_facade()
+        # 执行级别计时与步数统计（仅用于日志展示）
+        self._start_ts: float = 0.0
+        self._steps_done: int = 0
+        self._budget_tokens: int = 0
+
+    async def _detect_intent(self, user_query: str) -> Dict[str, bool]:
+        """基于用户问题识别意图：是否只检索文献/只检索临床试验/两者都检索"""
+        q = (user_query or "").lower()
+        trials_keywords = ["临床试验", "试验", "nct", "clinical trial", "入组", "排除标准"]
+        papers_keywords = ["文献", "论文", "pmid", "研究", "综述", "paper"]
+        use_trials = any(k in q for k in trials_keywords)
+        use_papers = any(k in q for k in papers_keywords)
+        # 如果用户没有明确指出，则默认两者都检索
+        if not use_trials and not use_papers:
+            use_trials = True
+            use_papers = True
+        return {"use_papers": use_papers, "use_trials": use_trials}
 
     async def execute_with_streaming(
             self,
@@ -79,35 +103,87 @@ class WorkflowService:
             'trial_analysis': '',
             'final_answer': '',
             'current_step': '',
-            'errors': []
+            'errors': [],
+            'intent': {'use_papers': True, 'use_trials': True}
         }
 
         try:
+            # 记录执行起始时间
+            self._start_ts = time.time()
+            self._steps_done = 0
+            self._budget_tokens = 0
+            # 可选：展示路由计划（仅日志/展示，不改变实际执行）
+
+            # 可选：展示型 plan（不改流程）
+            if settings.deliberate_enabled:
+                yield {
+                    'type': 'section_start',
+                    'step': 'plan_deliberate',
+                    'title': '🧩 规划（展示型）',
+                    'collapsible': True,
+                }
+                yield {
+                    'type': 'log',
+                    'step': 'plan_deliberate',
+                    'source': 'router',
+                    'content': 'plan: display_only=true reason=fixed_plan\n',
+                    'newline': True,
+                }
+                yield {'type': 'section_end', 'step': 'plan_deliberate'}
+
+            # 根据用户问题识别意图（决定使用哪些检索工具）
+            state['intent'] = await self._detect_intent(state['user_query'])
+
+            # 预加载缓存的患者特征（无附件时优先复用）
+            cached_pf = await self._load_cached_patient_features(state['conversation_id'])
+            if cached_pf and not state['user_attachments']:
+                state['patient_features'] = cached_pf
+
             # 执行所有步骤
             async for chunk in self._step_extract_features(state):
                 yield chunk
-                # 添加延迟确保前端接收
-                await asyncio.sleep(0.01)
 
             async for chunk in self._step_generate_queries(state):
                 yield chunk
-                await asyncio.sleep(0.01)
 
             async for chunk in self._step_search(state):
                 yield chunk
-                await asyncio.sleep(0.01)
 
             async for chunk in self._step_analyze_papers(state):
                 yield chunk
-                await asyncio.sleep(0.01)
 
             async for chunk in self._step_analyze_trials(state):
                 yield chunk
-                await asyncio.sleep(0.01)
+
+            # 可选：展示型 rerank 与 grounding（不改流程，仅日志）
+            if settings.deliberate_enabled:
+                # rerank 展示（保留展示，不改流程）
+                yield {
+                    'type': 'section_start',
+                    'step': 'rerank_deliberate',
+                    'title': '🔀 候选重排（展示型）',
+                    'collapsible': True,
+                }
+                rerank_basis = 'relevance,diversity,balance'
+                paper_cnt = len(state.get('papers', []) or [])
+                trial_cnt = len(state.get('trials', []) or [])
+                yield {
+                    'type': 'log',
+                    'step': 'rerank_deliberate',
+                    'source': 'workflow',
+                    'content': f'rerank: display_only=true basis={rerank_basis} candidates=paper:{paper_cnt},trial:{trial_cnt}\n',
+                    'newline': True,
+                }
+                yield {'type': 'section_end', 'step': 'rerank_deliberate'}
+
+                # grounding 实际校验（重要）：在展示段位置输出真实校验日志
+                async for chunk in self._step_grounding_check(state):
+                    yield chunk
 
             async for chunk in self._step_generate_final(state):
                 yield chunk
-                await asyncio.sleep(0.01)
+
+
 
             # 保存结果
             await self._save_result(state, execution_id, message_id)
@@ -117,7 +193,14 @@ class WorkflowService:
             # 生成标题
             if is_first_conversation:
                 logger.info(f"开始生成对话标题，对话ID: {conversation_id}")
-                await self._generate_title(state, conversation_id, user_id)
+                new_title = await self._generate_title(state, conversation_id, user_id)
+                # 通知前端标题已更新
+                if new_title:
+                    yield {
+                        'type': 'title_updated',
+                        'conversation_id': conversation_id,
+                        'title': new_title
+                    }
 
             # 最终完成信号
             yield {'type': 'done', 'content': ''}
@@ -150,14 +233,17 @@ class WorkflowService:
             'collapsible': True
         }
 
-        # 立即输出日志
-        yield {
-            'type': 'log',
-            'step': 'extract_features',
-            'source': 'extract_features',
-            'content': '正在分析患者信息...\n\n',
-            'newline': True
-        }
+        # 若已有缓存患者特征且当前没有附件，则直接复用并跳过提取
+        if state['patient_features'] and not state['user_attachments']:
+            yield {
+                'type': 'result',
+                'step': 'extract_features',
+                'content': state['patient_features'],
+                'is_incremental': False,
+                'summary': '✅ 复用患者特征（跳过提取）'
+            }
+            yield {'type': 'section_end', 'step': 'extract_features'}
+            return
 
         # 构建上下文
         context_parts = []
@@ -214,6 +300,7 @@ class WorkflowService:
                             history=[]
                     ):
                         full_response += token
+                        self._budget_tokens += 1
                         # 流式输出结果（增量）
                         yield {
                             'type': 'result',
@@ -230,6 +317,7 @@ class WorkflowService:
                             model=settings.qwen_long_model
                     ):
                         full_response += token
+                        self._budget_tokens += 1
                         # 流式输出结果（增量）
                         yield {
                             'type': 'result',
@@ -244,6 +332,7 @@ class WorkflowService:
                         system_prompt="你是一个专业的医疗信息分析助手。"
                 ):
                     full_response += token
+                    self._budget_tokens += 1
                     # 流式输出结果（增量）
                     yield {
                         'type': 'result',
@@ -316,6 +405,16 @@ class WorkflowService:
             'title': '🔍 生成检索条件',
             'collapsible': True
         }
+        # 按用户意图完全跳过该步骤（无需生成任何检索条件）
+        if not (state.get('intent', {}).get('use_papers', True) or state.get('intent', {}).get('use_trials', True)):
+            yield {
+                'type': 'result',
+                'step': 'generate_queries',
+                'content': 'ℹ️ 已按用户意图跳过检索条件生成',
+                'summary': 'ℹ️ 跳过检索条件生成'
+            }
+            yield {'type': 'section_end', 'step': 'generate_queries'}
+            return
 
         yield {
             'type': 'log',
@@ -325,7 +424,9 @@ class WorkflowService:
             'newline': True
         }
 
-        prompt = self.prompts.generate_queries(state['patient_features'])
+        need_papers = state.get('intent', {}).get('use_papers', True)
+        need_trials = state.get('intent', {}).get('use_trials', True)
+        prompt = self.prompts.generate_queries_selective(state['patient_features'], need_papers, need_trials)
         full_response = ""
 
         try:
@@ -334,6 +435,7 @@ class WorkflowService:
                     system_prompt="你是一个专业的检索条件生成助手。"
             ):
                 full_response += token
+                self._budget_tokens += 1
                 # 流式显示思考过程
                 yield {
                     'type': 'log',
@@ -369,6 +471,13 @@ class WorkflowService:
             else:
                 raise ValueError("未找到有效的JSON")
             
+            # 根据用户意图过滤不需要的检索项
+            if not state.get('intent', {}).get('use_papers', True):
+                state['pubmed_query'] = ''
+                state['europepmc_query'] = ''
+            if not state.get('intent', {}).get('use_trials', True):
+                state['clinical_trial_keywords'] = ''
+
             # 检查解析结果是否为空
             if not state['pubmed_query'] and not state['europepmc_query'] and not state['clinical_trial_keywords']:
                 error_msg = '❌ 生成的检索条件为空，请提供更具体的患者信息'
@@ -420,11 +529,23 @@ class WorkflowService:
             'title': '📚 执行多源检索',
             'collapsible': True
         }
+        # 按用户意图跳过检索
+        if not (state.get('intent', {}).get('use_papers', True) or state.get('intent', {}).get('use_trials', True)):
+            yield {
+                'type': 'result',
+                'step': 'search',
+                'content': 'ℹ️ 已按用户意图跳过检索',
+                'summary': 'ℹ️ 跳过检索'
+            }
+            yield {'type': 'section_end', 'step': 'search'}
+            return
         logging.getLogger("workflow_service").info("section_start search")
 
         progress_queue = asyncio.Queue()
         target_count = settings.max_search_results
         max_retries = 2  # 最多重试2次
+        need_papers = state.get('intent', {}).get('use_papers', True)
+        need_trials = state.get('intent', {}).get('use_trials', True)
         
         for retry in range(max_retries + 1):
             if retry > 0:
@@ -434,75 +555,170 @@ class WorkflowService:
                     'content': f'\n⚠️ 第{retry}次检索结果为0，正在放宽条件重试...\n',
                     'newline': True
                 }
-                # 放宽检索条件
-                state['pubmed_query'], state['europepmc_query'] = await self._relax_queries(
-                    state['pubmed_query'], 
-                    state['europepmc_query'],
-                    state['patient_features']
-                )
-                yield {
-                    'type': 'log',
-                    'source': 'search',
-                    'content': f'🔄 放宽后 PubMed: `{state["pubmed_query"]}`\n🔄 放宽后 Europe PMC: `{state["europepmc_query"]}`\n',
-                    'newline': True
-                }
+                relaxed_msgs = []
+                # 放宽检索条件（文献+试验）
+                if need_papers:
+                    state['pubmed_query'], state['europepmc_query'] = await self._relax_queries(
+                        state['pubmed_query'], 
+                        state['europepmc_query'],
+                        state['patient_features']
+                    )
+                    relaxed_msgs.append(f'🔄 放宽后 PubMed: `{state["pubmed_query"]}`')
+                    relaxed_msgs.append(f'🔄 放宽后 Europe PMC: `{state["europepmc_query"]}`')
+                # 放宽试验关键词
+                if need_trials:
+                    state['clinical_trial_keywords'] = await self._relax_trials_keywords(
+                        state['clinical_trial_keywords'],
+                        state['patient_features']
+                    )
+                    relaxed_msgs.append(f'🔄 放宽后 Trials: `{state["clinical_trial_keywords"]}`')
+                if relaxed_msgs:
+                    yield {
+                        'type': 'log',
+                        'source': 'search',
+                        'content': "\n".join(relaxed_msgs) + "\n",
+                        'newline': True
+                    }
 
             async def search_all():
                 """执行检索任务"""
                 try:
-                    # 分别使用不同的检索条件
-                    papers_pubmed = await search_service._fetch_pubmed_papers(
-                        state['pubmed_query'],
-                        target_count,
-                        progress_queue
-                    )
-                    papers_europepmc = await search_service._fetch_europepmc_papers(
-                        state['europepmc_query'],
-                        target_count,
-                        progress_queue
-                    )
-                    
-                    # 合并、去重、排序
-                    all_papers = []
-                    if isinstance(papers_pubmed, list):
-                        all_papers.extend(papers_pubmed)
-                    if isinstance(papers_europepmc, list):
-                        all_papers.extend(papers_europepmc)
-                    
-                    # 去重
-                    all_papers = search_service._deduplicate_papers(all_papers)
-                    
-                    # 计算相关度并排序（使用 PubMed query 作为基准）
-                    for paper in all_papers:
-                        title_score = search_service._calculate_relevance(state['pubmed_query'], paper.get('title', ''))
-                        abstract_score = search_service._calculate_relevance(state['pubmed_query'], paper.get('abstract', ''))
-                        paper['relevance_score'] = (title_score * 0.7 + abstract_score * 0.3)
-                    
-                    all_papers.sort(key=lambda p: p.get('relevance_score', 0), reverse=True)
-                    selected_papers = all_papers[:target_count]
-                    
-                    state['papers'].extend(selected_papers)
+                    async def _fetch_papers_via_tools(query: str, label: str, sources: List[str], fallback_coro):
+                        if not query:
+                            return []
+                        await progress_queue.put({
+                            'type': 'log',
+                            'source': label,
+                            'content': f'🔍 使用工具接口检索 {label}，检索式: `{query}`\n',
+                            'newline': True
+                        })
+                        try:
+                            result = await self.tools.search_papers(
+                                query=query,
+                                size=target_count,
+                                sources=sources
+                            )
+                            papers = [paper.dict() for paper in result.papers]
+                            await progress_queue.put({
+                                'type': 'log',
+                                'source': label,
+                                'content': f'✅ 工具接口返回 {len(papers)} 篇文献\n',
+                                'newline': True
+                            })
+                            return papers
+                        except Exception as tool_error:
+                            await progress_queue.put({
+                                'type': 'log',
+                                'source': label,
+                                'content': f'⚠️ 工具接口检索失败，回退本地实现: {tool_error}\n',
+                                'newline': True
+                            })
+                            return await fallback_coro()
 
-                    trials = await search_service.search_trials_with_ranking(
-                        state['clinical_trial_keywords'],
-                        target_count,
-                        progress_queue
+                    logger.info(
+                        "search start pubmed_query=%s europepmc_query=%s trials_keywords=%s",
+                        state.get('pubmed_query'),
+                        state.get('europepmc_query'),
+                        state.get('clinical_trial_keywords')
                     )
-                    state['trials'].extend(trials)
-                    try:
-                        logging.getLogger("workflow_service").info(
-                            "trials fetched count=%d keywords=%s",
-                            len(state['trials']),
-                            state.get('clinical_trial_keywords')
+
+                    all_papers: List[Dict] = []
+
+                    if need_papers and (state['pubmed_query'] or state['europepmc_query']):
+                        tasks: List[asyncio.Task] = []
+
+                        if state['pubmed_query']:
+                            async def _fallback_pubmed():
+                                return await search_service._fetch_pubmed_papers(
+                                    state['pubmed_query'],
+                                    target_count,
+                                    progress_queue
+                                )
+                            tasks.append(asyncio.create_task(_fetch_papers_via_tools(
+                                state['pubmed_query'],
+                                'pubmed',
+                                ['pubmed'],
+                                _fallback_pubmed
+                            )))
+
+                        if state['europepmc_query']:
+                            async def _fallback_europepmc():
+                                return await search_service._fetch_europepmc_papers(
+                                    state['europepmc_query'],
+                                    target_count,
+                                    progress_queue
+                                )
+                            tasks.append(asyncio.create_task(_fetch_papers_via_tools(
+                                state['europepmc_query'],
+                                'europepmc',
+                                ['europepmc'],
+                                _fallback_europepmc
+                            )))
+
+                        if tasks:
+                            paper_batches = await asyncio.gather(*tasks)
+                            for batch in paper_batches:
+                                if batch:
+                                    all_papers.extend(batch)
+
+                    # 去重、打分并限制数量
+                    if all_papers:
+                        state['papers'].extend(all_papers)
+                        state['papers'] = self._trim_and_score_papers(
+                            state['papers'],
+                            state['pubmed_query'],
+                            state['europepmc_query'],
+                            target_count
                         )
-                        # 采样前3个标题用于快速确认
-                        sample_titles = [t.get('title') for t in state['trials'][:3]]
-                        logging.getLogger("workflow_service").info(
-                            "trials sample titles=%s",
-                            sample_titles
-                        )
-                    except Exception:
-                        pass
+
+                    # 仅在需要试验检索时执行
+                    if state.get('intent', {}).get('use_trials', True) and state['clinical_trial_keywords']:
+                        try:
+                            trials_result = await self.tools.search_trials(
+                                state['clinical_trial_keywords'],
+                                target_count,
+                            )
+                            # ToolsFacade 使用统一模型；此处转换为原来的 dict 结构
+                            converted = [
+                                {
+                                    'nct_id': t.nct_id,
+                                    'title': t.title,
+                                    'status': t.status,
+                                    'phase': t.phase,
+                                    'conditions': t.conditions,
+                                    'sponsor': t.sponsor,
+                                    'locations': t.locations,
+                                    'source_url': t.source_url,
+                                }
+                                for t in trials_result.trials
+                            ]
+                            state['trials'].extend(converted)
+                        except Exception as _e:
+                            # 回退老实现，保持兼容
+                            trials = await search_service.search_trials_with_ranking(
+                                state['clinical_trial_keywords'],
+                                target_count,
+                                progress_queue
+                            )
+                            state['trials'].extend(trials)
+                        if state['trials']:
+                            state['trials'] = self._trim_trials(state['trials'], target_count)
+                        if not state['trials']:
+                            logger.info("trials empty for keywords=%s", state.get('clinical_trial_keywords'))
+                        try:
+                            logging.getLogger("workflow_service").info(
+                                "trials fetched count=%d keywords=%s",
+                                len(state['trials']),
+                                state.get('clinical_trial_keywords')
+                            )
+                            # 采样前3个标题用于快速确认
+                            sample_titles = [t.get('title') for t in state['trials'][:3]]
+                            logging.getLogger("workflow_service").info(
+                                "trials sample titles=%s",
+                                sample_titles
+                            )
+                        except Exception:
+                            pass
 
                 except Exception as e:
                     await progress_queue.put({
@@ -536,7 +752,7 @@ class WorkflowService:
             await search_task
             
             # 检查结果
-            if len(state['papers']) > 0 or retry >= max_retries:
+            if self._should_stop_search(state, need_papers, need_trials) or retry >= max_retries:
                 break  # 有结果或达到最大重试次数，退出
 
         # 汇总结果
@@ -555,6 +771,58 @@ class WorkflowService:
         }
 
         yield {'type': 'section_end', 'step': 'search'}
+
+    def _trim_and_score_papers(
+            self,
+            papers: List[Dict],
+            pubmed_query: str,
+            europepmc_query: str,
+            limit: int
+    ) -> List[Dict]:
+        deduped = search_service._deduplicate_papers(papers)
+        for paper in deduped:
+            query = self._select_query_for_paper(paper, pubmed_query, europepmc_query)
+            title_score = search_service._calculate_relevance(query, paper.get('title', ''))
+            abstract_score = search_service._calculate_relevance(query, paper.get('abstract', ''))
+            paper['relevance_score'] = (title_score * 0.7 + abstract_score * 0.3)
+        deduped.sort(key=lambda p: p.get('relevance_score', 0), reverse=True)
+        return deduped[:limit] if limit and limit > 0 else deduped
+
+    def _select_query_for_paper(self, paper: Dict, pubmed_query: str, europepmc_query: str) -> str:
+        source = (paper.get('source_type') or '').lower()
+        if source == 'europepmc' and europepmc_query:
+            return europepmc_query
+        if source == 'pubmed' and pubmed_query:
+            return pubmed_query
+        # fallback：任选可用的 query
+        if pubmed_query:
+            return pubmed_query
+        if europepmc_query:
+            return europepmc_query
+        return ''
+
+    def _should_stop_search(self, state: WorkflowState, need_papers: bool, need_trials: bool) -> bool:
+        has_papers = len(state.get('papers', [])) > 0
+        has_trials = len(state.get('trials', [])) > 0
+        if need_papers and not need_trials:
+            return has_papers
+        if need_trials and not need_papers:
+            return has_trials
+        if need_papers and need_trials:
+            return has_papers or has_trials
+        return True
+
+    def _trim_trials(self, trials: List[Dict], limit: int) -> List[Dict]:
+        seen: Set[str] = set()
+        unique: List[Dict] = []
+        for trial in trials:
+            key = (trial.get('nct_id') or '').strip()
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            unique.append(trial)
+        return unique[:limit] if limit and limit > 0 else unique
     
     async def _relax_queries(self, pubmed_query: str, europepmc_query: str, patient_features: str) -> tuple:
         """放宽检索条件（移除最不重要的条件）"""
@@ -573,6 +841,31 @@ class WorkflowService:
         
         return relaxed_pubmed, relaxed_europepmc
 
+    async def _relax_trials_keywords(self, trial_keywords: str, patient_features: str) -> str:
+        """放宽临床试验关键词：减少过窄词、增加同义词/核心词，输出逗号分隔的3-5个关键词"""
+        base = (trial_keywords or '').strip()
+        prompt = f"""基于患者特征与当前临床试验关键词，生成更宽松的关键词（3-5个，逗号分隔）。
+
+患者特征：{patient_features[:400]}
+当前关键词：{base or '（空）'}
+
+要求：
+- 去除过窄的修饰词，保留疾病名称、药物/机制、阶段等核心词
+- 仅输出关键词，用逗号分隔；不要输出额外说明
+- 若当前为空，请根据患者特征生成合理的3-5个关键词
+"""
+        resp = ''
+        try:
+            async for token in llm_service.chat_with_context(
+                user_query=prompt,
+                system_prompt="你是一个检索策略助手，负责放宽临床试验关键词。"
+            ):
+                resp += token
+        except Exception:
+            return base or ''
+        # 规范化：以逗号分割，去空白，最多5个
+        parts = [p.strip() for p in resp.split(',') if p.strip()]
+        return ', '.join(parts[:5])
     async def _step_analyze_papers(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
         """步骤4: 分析文献（使用统一接口）"""
         state['current_step'] = 'analyze_papers'
@@ -583,6 +876,16 @@ class WorkflowService:
             'title': '📄 分析文献',
             'collapsible': True
         }
+        # 按用户意图跳过文献分析
+        if not state.get('intent', {}).get('use_papers', True):
+            yield {
+                'type': 'result',
+                'step': 'analyze_papers',
+                'content': 'ℹ️ 已按用户意图跳过文献分析',
+                'summary': 'ℹ️ 跳过文献分析'
+            }
+            yield {'type': 'section_end', 'step': 'analyze_papers'}
+            return
 
         if not state['papers']:
             yield {
@@ -624,28 +927,22 @@ class WorkflowService:
 
             analysis = ""
             try:
-                # 获取文件ID
-                file_id = await file_service.get_or_upload_file(pdf_path)
-
-                if not file_id:
-                    raise Exception("文件上传失败")
-
-                # 使用统一接口分析
-                async for token in llm_service.chat_with_context(
-                        user_query=prompt,
-                        file_ids=[file_id],
-                        system_prompt="你是一个专业的医疗文献分析助手。请仔细阅读PDF文档，按照指定格式输出结构化分析。",
-                        model=settings.qwen_long_model
-                ):
+                # 优先通过工具接口层进行 PDF 流式分析
+                async for token in self.tools.analyze_pdf_stream(
+                        patient_features=state['patient_features'],
+                        user_query=state['user_query'],
+                        pdf_path=pdf_path,
+                ):  # type: ignore
                     analysis += token
-                    # 流式输出（增量）
+                    self._budget_tokens += 1
                     yield {
                         'type': 'result',
                         'step': 'analyze_papers',
                         'content': token,
                         'is_incremental': True
                     }
-
+                
+                # 成功分析后，将结果添加到状态中
                 state['paper_analyses'].append({
                     'paper': paper,
                     'analysis': analysis
@@ -665,15 +962,64 @@ class WorkflowService:
                         'title': paper['title']
                     }
                 }
-
             except Exception as e:
-                yield {
-                    'type': 'log',
-                    'step': 'analyze_papers',
-                    'source': 'analyze_papers',
-                    'content': f'❌ 分析失败: {str(e)}\n',
-                    'newline': True
-                }
+                # 回退：沿用现有 llm_service + file_service 路径，保证兼容
+                try:
+                    file_id = await file_service.get_or_upload_file(pdf_path)
+                    if not file_id:
+                        raise Exception("文件上传失败")
+                    
+                    prompt = self.prompts.analyze_paper(
+                        state['patient_features'],
+                        state['user_query'],
+                        paper
+                    )
+                    
+                    analysis = ""
+                    async for token in llm_service.chat_with_context(
+                            user_query=prompt,
+                            file_ids=[file_id],
+                            system_prompt="你是一个专业的医疗文献分析助手。请仔细阅读PDF文档，按照指定格式输出结构化分析。",
+                            model=settings.qwen_long_model
+                    ):
+                        analysis += token
+                        self._budget_tokens += 1
+                        yield {
+                            'type': 'result',
+                            'step': 'analyze_papers',
+                            'content': token,
+                            'is_incremental': True
+                        }
+                    
+                    # 成功分析后，将结果添加到状态中
+                    state['paper_analyses'].append({
+                        'paper': paper,
+                        'analysis': analysis
+                    })
+                    
+                    # 最后推送完整内容
+                    yield {
+                        'type': 'result',
+                        'step': 'analyze_papers',
+                        'content': f"""### 文献 {i+1}: {paper['title']}
+
+{analysis}""",
+                        'is_incremental': False,
+                        'data': {
+                            'paper_id': paper.get('id'),
+                            'pmid': paper.get('pmid'),
+                            'title': paper['title']
+                        }
+                    }
+                except Exception as fallback_e:
+                    yield {
+                        'type': 'log',
+                        'step': 'analyze_papers',
+                        'source': 'analyze_papers',
+                        'content': f'❌ 分析失败: {str(fallback_e)}\n',
+                        'newline': True
+                    }
+                    continue
 
         yield {
             'type': 'result',
@@ -694,6 +1040,16 @@ class WorkflowService:
             'title': '💊 分析临床试验',
             'collapsible': True
         }
+        # 按用户意图跳过临床试验分析
+        if not state.get('intent', {}).get('use_trials', True):
+            yield {
+                'type': 'result',
+                'step': 'analyze_trials',
+                'content': 'ℹ️ 已按用户意图跳过临床试验分析',
+                'summary': 'ℹ️ 跳过临床试验分析'
+            }
+            yield {'type': 'section_end', 'step': 'analyze_trials'}
+            return
 
         if not state['trials']:
             yield {
@@ -724,52 +1080,54 @@ class WorkflowService:
 """
             trials_text.append(trial_info)
 
-        prompt = self.prompts.analyze_trials(
-            state['patient_features'],
-            '\n'.join(trials_text)
-        )
-
+        # 使用工具接口层进行流式分析，保持 SSE 输出不变
         analysis = ""
         try:
-            logger.info(
-                "analyze_trials start trials=%d model=%s prompt_len=%d",
-                len(state['trials']),
-                settings.qwen_long_model,
-                len(prompt)
-            )
+            # 转换为工具层 Trial 模型
+            tool_trials = [
+                ToolTrial(
+                    nct_id=t.get('nct_id', ''),
+                    title=t.get('title', ''),
+                    status=t.get('status'),
+                    phase=t.get('phase'),
+                    conditions=t.get('conditions'),
+                    sponsor=t.get('sponsor'),
+                    locations=t.get('locations'),
+                    source_url=t.get('source_url'),
+                )
+                for t in state['trials']
+            ]
+
             _token_count = 0
-            async for token in llm_service.chat_with_context(
-                    user_query=prompt,
-                    system_prompt="你是一个专业的临床试验分析助手。",
-                    model=settings.qwen_long_model
-            ):
+            async for token in self.tools.analyze_trials_stream(
+                state['patient_features'],
+                tool_trials,
+            ):  # type: ignore
                 analysis += token
                 _token_count += 1
-                # 流式输出结果（增量）
+                self._budget_tokens += 1
                 yield {
                     'type': 'result',
                     'step': 'analyze_trials',
                     'content': token,
-                    'is_incremental': True
+                    'is_incremental': True,
                 }
 
             logger.info(
                 "analyze_trials done tokens=%d content_len=%d",
                 _token_count,
-                len(analysis)
+                len(analysis),
             )
             if not analysis:
                 logger.warning("No analysis output")
 
             state['trial_analysis'] = analysis
-            
-            # 最后推送完整内容和summary
             yield {
                 'type': 'result',
                 'step': 'analyze_trials',
                 'content': analysis,
                 'is_incremental': False,
-                'summary': f'✅ 临床试验分析完成（{len(state["trials"])} 个）'
+                'summary': f'✅ 临床试验分析完成（{len(state["trials"])} 个）',
             }
 
         except Exception as e:
@@ -817,20 +1175,39 @@ class WorkflowService:
 
         final_answer = ""
         try:
-            async for token in llm_service.chat_with_context(
-                    user_query=prompt,
-                    system_prompt="你是一个专业的医疗咨询报告生成助手。"
-            ):
-                final_answer += token
-                # 流式输出
-                yield {
-                    'type': 'token',
-                    'step': 'generate_final',
-                    'content': token
-                }
+            # 优先通过工具接口层生成报告（一次性文本），再按字符回放为 token 以保持前端体验
+            try:
+                report = await self.tools.generate_report(
+                    user_query=state['user_query'],
+                    patient_features=state['patient_features'],
+                    papers_summary='\n'.join(papers_summary) if papers_summary else "暂无",
+                    trial_analysis=state['trial_analysis'],
+                )
+                final_answer = report.final_answer or ""
+                for ch in final_answer:
+                    yield {
+                        'type': 'token',
+                        'step': 'generate_final',
+                        'content': ch,
+                    }
+                    self._budget_tokens += 1
+            except Exception:
+                # 回退：沿用现有 llm_service 流式路径
+                async for token in llm_service.chat_with_context(
+                        user_query=prompt,
+                        system_prompt="你是一个专业的医疗咨询报告生成助手。",
+                        model=settings.qwen_long_model
+                ):
+                    final_answer += token
+                    self._budget_tokens += 1
+                    yield {
+                        'type': 'token',
+                        'step': 'generate_final',
+                        'content': token
+                    }
 
+            # 保存最终答案并输出完成汇总
             state['final_answer'] = final_answer
-
             yield {
                 'type': 'result',
                 'step': 'generate_final',
@@ -849,8 +1226,70 @@ class WorkflowService:
 
         yield {'type': 'section_end', 'step': 'generate_final'}
 
-    async def _generate_title(self, state: WorkflowState, conversation_id: int, user_id: int):
-        """生成对话标题"""
+    async def _step_grounding_check(self, state: WorkflowState) -> AsyncGenerator[Dict, None]:
+        """证据对齐与冲突检测：输出结构化日志（不改变业务结果）。"""
+        import re
+        yield {
+            'type': 'section_start',
+            'step': 'grounding_deliberate',
+            'title': '🧷 证据对齐（Grounding）',
+            'collapsible': True,
+        }
+        # Grounding 文本来源：临床试验分析 + 各文献分析正文
+        trial_text = state.get('trial_analysis') or ''
+        paper_texts = []
+        for item in state.get('paper_analyses', []) or []:
+            try:
+                paper = item.get('paper') or {}
+                title = paper.get('title') or ''
+                analysis = item.get('analysis') or ''
+                if title or analysis:
+                    paper_texts.append(f"{title}\n{analysis}")
+            except Exception:
+                continue
+        text = trial_text + ('\n' if trial_text and paper_texts else '') + '\n'.join(paper_texts)
+        # 提取引用锚点
+        pmids = set(re.findall(r"PMID[:\s]?\d+", text, flags=re.IGNORECASE))
+        ncts = set(re.findall(r"NCT\d+", text, flags=0))
+        refs_count = len(pmids) + len(ncts)
+        if refs_count == 0:
+            yield {'type': 'log', 'step': 'grounding_deliberate', 'source': 'grounding', 'content': 'warn: no_citations_found\n', 'newline': True}
+        else:
+            yield {'type': 'log', 'step': 'grounding_deliberate', 'source': 'grounding', 'content': f'citations: count={refs_count} pmids={len(pmids)} ncts={len(ncts)}\n', 'newline': True}
+
+        # 简单一致性/冲突检测（启发式）
+        lower = text.lower()
+        has_positive = any(k in lower for k in ['显著提高', 'significant improvement', 'effective'])
+        has_negative = any(k in lower for k in ['未显示显著', 'no significant', 'ineffective'])
+        if has_positive and has_negative:
+            yield {'type': 'log', 'step': 'grounding_deliberate', 'source': 'grounding', 'content': 'conflict: positive_vs_negative_evidence\n', 'newline': True}
+
+        # 追溯性：展示若干引用样例
+        sample_refs = list(pmids)[:3] + list(ncts)[:3]
+        if sample_refs:
+            yield {'type': 'log', 'step': 'grounding_deliberate', 'source': 'grounding', 'content': f'trace: sample_refs={", ".join(sample_refs)}\n', 'newline': True}
+
+        yield {'type': 'section_end', 'step': 'grounding_deliberate'}
+
+        # 可选：展示型 critique（不改流程）
+        if settings.deliberate_enabled:
+            yield {
+                'type': 'section_start',
+                'step': 'critique_deliberate',
+                'title': '🧪 评审（展示型）',
+                'collapsible': True,
+            }
+            yield {
+                'type': 'log',
+                'step': 'critique_deliberate',
+                'source': 'router',
+                'content': 'critique: display_only=true checks=[format,consistency]\n',
+                'newline': True,
+            }
+            yield {'type': 'section_end', 'step': 'critique_deliberate'}
+
+    async def _generate_title(self, state: WorkflowState, conversation_id: int, user_id: int) -> Optional[str]:
+        """生成对话标题，返回新标题"""
         try:
             title_prompt = f"""请根据以下医疗咨询内容生成一个简短的标题（不超过15个字）：
 
@@ -891,11 +1330,14 @@ class WorkflowService:
                     )
 
                 logger.info(f"对话 {conversation_id} 已自动重命名为「{new_title}」")
+                return new_title
             else:
                 logger.warning(f"生成的标题无效，标题: {new_title}")
+                return None
 
         except Exception as e:
             logger.error(f"生成标题失败: {e}")
+            return None
 
     async def _create_execution(self, conversation_id: int, user_id: int) -> int:
         """创建执行记录"""
@@ -944,45 +1386,70 @@ class WorkflowService:
                 for m in reversed(list(messages))
             ]
 
+    async def _load_cached_patient_features(self, conversation_id: int) -> Optional[str]:
+        """从之前的工作流执行记录中加载缓存的患者特征"""
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(WorkflowExecution)
+                .where(WorkflowExecution.conversation_id == conversation_id)
+                .where(WorkflowExecution.patient_features.isnot(None))
+                .order_by(WorkflowExecution.created_at.desc())
+                .limit(1)
+            )
+            execution = result.scalar_one_or_none()
+            
+            if execution and execution.patient_features:
+                logger.info(f"从执行记录 {execution.id} 中加载缓存的患者特征")
+                return execution.patient_features
+            
+            return None
+
     async def _save_result(self, state: WorkflowState, execution_id: int, message_id: int):
         """保存最终结果"""
         async with get_db_session() as db:
-            full_content = f"""# 多源检索分析报告
+            # 动态构建报告内容
+            full_parts: list[str] = []
+            full_parts.append("# 多源检索分析报告\n\n")
 
-## 1. 患者特征分析
-{state['patient_features']}
+            # 1. 患者特征
+            full_parts.append("## 1. 患者特征分析\n")
+            full_parts.append(f"{state['patient_features']}\n\n---\n")
 
----
+            # 2. 检索条件（按需输出）
+            full_parts.append("\n## 2. 检索条件\n")
+            added_any = False
+            if state.get('intent', {}).get('use_papers', True):
+                if state['pubmed_query']:
+                    full_parts.append(f"- **PubMed**: `{state['pubmed_query']}`\n"); added_any = True
+                if state['europepmc_query']:
+                    full_parts.append(f"- **Europe PMC**: `{state['europepmc_query']}`\n"); added_any = True
+            if state.get('intent', {}).get('use_trials', True) and state['clinical_trial_keywords']:
+                full_parts.append(f"- **临床试验**: `{state['clinical_trial_keywords']}`\n"); added_any = True
+            if not added_any:
+                full_parts.append("- 暂无\n")
+            full_parts.append("\n---\n")
 
-## 2. 检索条件
-- **PubMed**: `{state['pubmed_query']}`
-- **临床试验**: `{state['clinical_trial_keywords']}`
+            # 3. 检索结果汇总
+            full_parts.append("\n## 3. 检索结果\n")
+            full_parts.append(f"- **文献数量**: {len(state['papers'])} 篇\n")
+            full_parts.append(f"- **临床试验数量**: {len(state['trials'])} 个\n\n---\n")
 
----
-
-## 3. 检索结果
-- **文献数量**: {len(state['papers'])} 篇
-- **临床试验数量**: {len(state['trials'])} 个
-
----
-
-## 4. 文献分析
-"""
-
-            if state['paper_analyses']:
+            # 4. 文献分析（如有且用户需要）
+            if state.get('intent', {}).get('use_papers', True) and state['paper_analyses']:
+                full_parts.append("\n## 4. 文献分析\n\n")
                 for i, item in enumerate(state['paper_analyses']):
-                    full_content += f"\n### 文献 {i+1}: {item['paper']['title']}\n\n"
-                    full_content += f"{item['analysis']}\n\n---\n"
-            else:
-                full_content += "\n暂无文献分析\n\n---\n"
+                    full_parts.append(f"\n### 文献 {i+1}: {item['paper']['title']}\n\n")
+                    full_parts.append(f"{item['analysis']}\n\n---\n")
 
-            full_content += f"\n## 5. 临床试验分析\n\n"
-            if state['trial_analysis']:
-                full_content += f"{state['trial_analysis']}\n\n---\n"
-            else:
-                full_content += "\n暂无临床试验分析\n\n---\n"
+            # 5. 临床试验分析（如有且用户需要）
+            if state.get('intent', {}).get('use_trials', True) and state['trial_analysis']:
+                full_parts.append("\n## 5. 临床试验分析\n\n")
+                full_parts.append(f"{state['trial_analysis']}\n\n---\n")
 
-            full_content += f"\n## 6. 综合报告\n\n{state['final_answer']}\n"
+            # 6. 综合报告
+            full_parts.append(f"\n## 6. 综合报告\n\n{state['final_answer']}\n")
+
+            full_content = "".join(full_parts)
 
             # 构建元数据
             metadata = {

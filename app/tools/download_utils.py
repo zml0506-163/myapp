@@ -3,6 +3,7 @@ import shutil
 import socket
 import tarfile
 import warnings
+from urllib3.exceptions import InsecureRequestWarning
 from ftplib import error_perm, FTP
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError

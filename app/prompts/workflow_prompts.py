@@ -51,43 +51,43 @@ EXTRACT_FAILED: 无法从提供的信息中提取出有效的患者特征，请�
 **如果成功提取，请以结构化的方式列出这些信息**。如果某些信息未提及，请标注“未提及”。"""
 
     @staticmethod
-    def generate_queries(patient_features: str) -> str:
-        """生成检索条件的提示词"""
-        return f"""基于以下患者特征，生成精确且适度的检索条件：
+    def generate_queries_selective(patient_features: str, need_papers: bool, need_trials: bool) -> str:
+        """根据需要只生成部分检索条件，避免无谓大模型调用"""
+        sections = []
+        if need_papers:
+            sections.append("""
+1. **PubMed 检索表达式**: 使用布尔运算符（AND、OR）和 MeSH 主题词[Mesh]，例如：
+   - `"Small Cell Lung Cancer"[Mesh] AND "Durvalumab"[All Fields]`
+   - 只保留核心条件（疾病名称 + 1-2个关键词）
+2. **Europe PMC 检索关键词**: 提取3-5个核心关键词，用逗号分隔
+""".strip())
+        if need_trials:
+            sections.append("""
+3. **ClinicalTrials.gov 关键词**: 提取3-5个核心关键词，用逗号分隔
+""".strip())
+        guide = "\n".join(sections) if sections else "请输出一个空的 JSON 对象 {}" 
+        # JSON 模式：仅包含需要的键
+        keys = []
+        if need_papers:
+            keys += ["\"pubmed_query\": \"...\"", "\"europepmc_query\": \"...\""]
+        if need_trials:
+            keys += ["\"clinical_trial_keywords\": \"...\""]
+        json_schema = "{" + ", ".join(keys) + "}"
+        return f"""基于以下患者特征，生成所需的检索条件：
 
 ### 患者特征
 {patient_features}
 
 ### 任务
-请生成以下检索条件：
-
-1. **PubMed 检索表达式**: 使用布尔运算符（AND、OR）和 MeSH 主题词[Mesh]，例如：
-   - `"Small Cell Lung Cancer"[Mesh] AND "Durvalumab"[All Fields]`
-   - 注意：**只保留核心检索条件**，不要过度限制（如只针对疾病名称 + 1-2个关键词）
-
-2. **Europe PMC 检索关键词**: 提取3-5个核心关键词，用逗号分隔，例如：
-   - `small cell lung cancer, extensive stage, PIK3CA`
-   - 注意：Europe PMC 不支持复杂的布尔表达式，只使用简单关键词
-
-3. **ClinicalTrials.gov 关键词**: 提取3-5个核心关键词，用逗号分隔
+{guide}
 
 ---
 
-### ⚠️ 重要：输出格式约定
-
-**如果无法生成有效的检索条件（比如患者特征为空或不包含医疗信息），请直接输出**：
-
-GENERATE_FAILED: 无法根据提供的信息生成检索条件，请提供更具体的疾病、基因或治疗信息。
-
-**如果成功生成，必须严格遵守JSON格式**：
-
-{{
-    "pubmed_query": "这里是PubMed检索表达式，使用MeSH和布尔运算符",
-    "europepmc_query": "这里是Europe PMC关键词，用逗号分隔",
-    "clinical_trial_keywords": "关键词1,关键词2,关键词3"
-}}
-
-只输出 JSON 或 GENERATE_FAILED 标记，不要有其他内容。"""
+### ⚠️ 输出格式
+- 若无法生成，请输出：`GENERATE_FAILED: 原因`
+- 若可以生成，请只输出 JSON，且仅包含需要的键：
+{json_schema}
+"""
 
     @staticmethod
     def analyze_paper(patient_features: str, user_query: str, paper: dict) -> str:
@@ -232,6 +232,11 @@ GENERATE_FAILED: 无法根据提供的信息生成检索条件，请提供更具
 {trial_analysis[:500] if trial_analysis else "暂无"}...
 
 ---
+
+### 输出规则
+- 如果用户问题明确指定了报告结构或只关注某类内容（如仅临床试验），请严格按其要求输出，仅保留相关部分。
+- 如果某个部分为“暂无”，请省略该部分，不要输出空章节。
+- 若用户未明确指定结构，则按照下列默认结构生成。
 
 ### 报告要求
 请生成一份专业的医疗咨询报告，包含：

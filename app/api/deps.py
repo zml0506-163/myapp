@@ -30,10 +30,16 @@ async def get_current_user(
         if not all([user_id, username, email, is_superuser is not None, is_active is not None]):
             raise credentials_exception
 
+        # 确保user_id不是None再转换为int
+        if user_id is None:
+            raise credentials_exception
+        
+        # 类型断言，告诉类型检查器user_id在这里不可能是None
+        assert user_id is not None
+        
         # 返回用户信息（可根据需要返回User对象或TokenUser）
-        # 类型断言：经过上面的校验，这些值不会是None
         return UserResponseSchema(
-            id=int(user_id),  # type: ignore
+            id=int(user_id),
             username=username,  # type: ignore
             email=email,  # type: ignore
             is_superuser=is_superuser,  # type: ignore
